@@ -1,0 +1,52 @@
+[package]
+name = "whosaidwhat"
+version = "0.1.0"
+edition = "2021"
+description = "Local-first macOS meeting assistant: detect, record, diarize, summarize — all on-device"
+license = "MIT"
+
+[lib]
+name = "whosaidwhat"
+path = "src/lib.rs"
+
+[[bin]]
+name = "whosaidwhat"
+path = "src/main.rs"
+
+[features]
+default = ["asr-whisper", "diarize-sherpa"]
+# Native ASR via whisper.cpp (Metal on Apple Silicon).
+asr-whisper = ["dep:whisper-rs"]
+# Native diarization via sherpa-onnx (pyannote segmentation-3.0 ONNX + speaker embeddings).
+diarize-sherpa = ["dep:sherpa-rs"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process"] }
+# oMLX speaks the OpenAI-compatible HTTP API; rustls avoids linking system OpenSSL.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+futures-util = "0.3"
+rusqlite = { version = "0.32", features = ["bundled"] }
+# Cross-platform process polling for the detection fallback path.
+sysinfo = "0.33"
+hound = "3.5"
+
+whisper-rs = { version = "0.14", features = ["metal"], optional = true }
+sherpa-rs = { version = "0.6", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = { version = "0.3", features = ["NSWorkspace", "NSRunningApplication"] }
+# CoreAudio property listeners for the mic-in-use signal.
+coreaudio-sys = "0.2"
+# Mic capture; system audio comes from ScreenCaptureKit (see capture::macos).
+cpal = "0.15"
+screencapturekit = "0.3"
+
+[dev-dependencies]

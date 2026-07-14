@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "/Users/papp/Library/CloudStorage/OneDrive-Personal/Winsome/Meetings/meetily_pipeline/pipeline.py", line 6, in <module>
+    from db_extractor import get_latest_transcript, DB_PATH
+ModuleNotFoundError: No module named 'db_extractor'
+Traceback (most recent call last):
+  File "/Users/papp/Library/CloudStorage/OneDrive-Personal/Winsome/Meetings/meetily_pipeline/pipeline.py", line 6, in <module>
+    from db_extractor import get_latest_transcript, DB_PATH
+ModuleNotFoundError: No module named 'db_extractor'

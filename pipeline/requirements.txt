@@ -1,0 +1,11 @@
+# whosaidwhat pipeline — Apple Silicon (arm64 macOS) recommended set.
+# Core (summarization only — the meetily import path needs nothing else):
+openai>=2.0
+
+# ASR (pick one; mlx-whisper is the fast path on M-series):
+mlx-whisper>=0.4 ; platform_machine == "arm64" and sys_platform == "darwin"
+faster-whisper>=1.1 ; platform_machine != "arm64" or sys_platform != "darwin"
+
+# Diarization (pyannote community-1 pipeline):
+pyannote.audio>=4.0
+torch>=2.4
