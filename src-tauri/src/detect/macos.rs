@@ -163,9 +163,16 @@ impl MacSignalSource {
     /// True when some process other than ourselves is using the microphone.
     fn mic_in_use(&mut self) -> bool {
         if self.self_recording.load(Ordering::Relaxed) {
-            // Our own capture keeps the device-level flag pinned at 1;
-            // ask per-process instead (macOS 14+), or degrade gracefully.
-            self.mic.any_other_process_running_input().unwrap_or(false)
+            // Our own capture keeps the device-level flag pinned at 1, so use
+            // the macOS 14+ per-process API. When it is unavailable (pre-Sonoma)
+            // or errors it returns None: we then assume the mic is STILL in use
+            // (`true`), never `false`. Returning false here would be a
+            // correctness bug — for Teams/Meet the meeting marker itself is
+            // mic-gated, so a false reading fabricates a meeting-end ~10s into
+            // every recording. Assuming true instead means Teams end degrades
+            // to app-quit and Meet end to tab-close, which is the documented
+            // and safe behavior.
+            self.mic.any_other_process_running_input().unwrap_or(true)
         } else {
             self.mic.device_running_somewhere().unwrap_or(false)
         }

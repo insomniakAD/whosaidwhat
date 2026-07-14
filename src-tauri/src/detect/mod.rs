@@ -17,8 +17,12 @@ use state::{AppDetector, Debounce, DetectorEvent, MeetingApp, SignalSnapshot};
 
 /// Poll cadence while at least one conferencing app is running.
 pub const ACTIVE_POLL: Duration = Duration::from_secs(2);
-/// Poll cadence while nothing we watch is running (NSWorkspace launch
-/// notifications snap us back to the active cadence immediately).
+/// Poll cadence while nothing we watch is running. In the Tauri shell,
+/// `macos::workspace::WorkspaceWatcher` (which needs a main-thread run loop)
+/// can drop this to the active cadence the instant an app launches; the
+/// shipped headless daemon relies on the poll alone, so at idle a launch is
+/// noticed within one IDLE_POLL. The poll is always the source of truth — a
+/// missed notification can never wedge detection.
 pub const IDLE_POLL: Duration = Duration::from_secs(15);
 
 /// Anything that can produce per-app signal snapshots (macOS in production,
@@ -64,6 +68,19 @@ impl<S: SignalSource> Detector<S> {
     /// Whether any watched app is currently running (drives poll cadence).
     pub fn any_app_running(&self) -> bool {
         self.apps.iter().any(|a| a.phase() != state::MeetingPhase::Idle)
+    }
+
+    /// Apps whose detector is currently `InMeeting`. Used by the run loop to
+    /// recover a concurrent meeting that was ignored while another recording
+    /// was in progress: since the detector will not re-emit `MeetingStarted`
+    /// for an app already `InMeeting`, the loop re-offers these when the
+    /// session returns to Idle.
+    pub fn active_meetings(&self) -> Vec<MeetingApp> {
+        self.apps
+            .iter()
+            .filter(|a| a.phase() == state::MeetingPhase::InMeeting)
+            .map(|a| a.app().clone())
+            .collect()
     }
 
     /// One tick: poll signals, advance every app detector, return all events.

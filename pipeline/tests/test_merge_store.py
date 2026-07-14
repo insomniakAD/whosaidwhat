@@ -109,6 +109,51 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(count, 0, "failed save must leave no partial meeting")
         conn.close()
 
+    def test_anonymous_speakers_do_not_collide_across_meetings(self):
+        conn = store.open_store(self.db_path)
+        t = [Turn(speaker="SPEAKER_00", text="hi", start_ms=0, end_ms=10)]
+        store.save_meeting(conn, "One", t, "o", "n", "m")
+        store.save_meeting(conn, "Two", t, "o", "n", "m")
+        (count,) = conn.execute(
+            "SELECT COUNT(*) FROM speakers WHERE display_name='SPEAKER_00'"
+        ).fetchone()
+        self.assertEqual(count, 2, "each meeting's SPEAKER_00 must be its own row")
+        conn.close()
+
+    def test_self_speaker_single_and_source_set(self):
+        conn = store.open_store(self.db_path)
+        turns = [
+            Turn(speaker="Me", text="my words", start_ms=0, end_ms=1000),
+            Turn(speaker="SPEAKER_00", text="their words", start_ms=1000, end_ms=2000),
+        ]
+        store.save_meeting(conn, "One", turns, "o", "n", "m")
+        store.save_meeting(conn, "Two", turns, "o", "n", "m")
+        # One global self speaker across both meetings, marked is_self.
+        rows = conn.execute(
+            "SELECT COUNT(*), MAX(is_self) FROM speakers WHERE display_name='Me'"
+        ).fetchone()
+        self.assertEqual(rows, (1, 1))
+        # source provenance survived storage.
+        sources = {
+            (sp, src)
+            for (sp, src) in conn.execute(
+                "SELECT COALESCE(spk.display_name,'?'), seg.source FROM segments seg"
+                " LEFT JOIN speakers spk ON spk.id=seg.speaker_id"
+            )
+        }
+        self.assertIn(("Me", "mic"), sources)
+        self.assertIn(("SPEAKER_00", "system"), sources)
+        conn.close()
+
+    def test_fts_search_tolerates_punctuation(self):
+        conn = store.open_store(self.db_path)
+        t = [Turn(speaker="Me", text="we shipped covid-19 dashboards", start_ms=0, end_ms=10)]
+        store.save_meeting(conn, "One", t, "o", "n", "m")
+        self.assertEqual(len(store.search(conn, "covid-19")), 1)  # would be syntax error raw
+        self.assertEqual(store.search(conn, "don't"), [])
+        self.assertEqual(store.search(conn, "   "), [])
+        conn.close()
+
     def test_two_meetings_version_independently(self):
         conn = store.open_store(self.db_path)
         t = [Turn(speaker="A", text="x", start_ms=0, end_ms=10)]

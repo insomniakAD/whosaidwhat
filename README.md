@@ -13,8 +13,13 @@ evidence is logged in [`docs/BUILD_LOG.md`](docs/BUILD_LOG.md).
 Zoom / Teams / Meet meeting detected → "Start recording?" → two-track capture
 (mic + system audio) → auto-stop when the meeting ends → whisper.cpp transcription
 (Metal) + sherpa-onnx diarization → speaker-attributed transcript in SQLite (FTS5)
-→ 3-stage MapReduce summary via oMLX (Qwen3.6-35B-A3B) → versioned notes with
-per-takeaway citations back into the audio.
+→ 3-stage MapReduce summary via oMLX (Qwen3.6-35B-A3B) → versioned notes.
+
+Every transcript segment carries a millisecond offset, and the summarizer is
+prompted to preserve `[mm:ss]` markers, so notes can point back into the audio.
+The dedicated `summary_citations` / `action_items` tables that turn those markers
+into structured deep-links are schema-defined and ready, but not yet populated —
+see [status](#honest-status).
 
 Full diagram: [`docs/00-architecture.md`](docs/00-architecture.md)
 
@@ -65,6 +70,17 @@ records per policy (`config.json`: prompt/auto/manual), pipelines on meeting end
 
 Authored in a sandbox with a default-deny egress proxy (no crates.io/PyPI, most
 sites unfetchable): the pure-logic core is compiled and tested here (30 Rust +
-18 Python tests, schema exercised end-to-end); macOS FFI and third-party-crate
+21 Python tests, schema exercised end-to-end; 4 more rusqlite-backed Rust tests
+run under `cargo test`); macOS FFI and third-party-crate
 surfaces are written from cited evidence and flagged in-file where the first
 `cargo build` on a Mac is the type-check. Details: BUILD_LOG D-006/D-008.
+
+**What is not yet built** (schema/traits ready, code pending — tracked honestly
+rather than claimed done): structured `summary_citations` + `action_items`
+extraction (the summarizer preserves `[mm:ss]` markers inline today); the Tauri
+frontend shell (the notification prompt, recording pill, and dashboard from
+docs/01 are designed and the backend traits exist, but no `tauri.conf.json` /
+webview is in this repo yet); the `un_center` bundled-build notification path;
+and moving the post-recording pipeline off the detection thread. The headless
+daemon runs the full detect → capture → transcribe → diarize → summarize → store
+loop under `RecordPolicy::Auto`.

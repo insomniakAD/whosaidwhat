@@ -112,7 +112,9 @@ delivered through the plugin on macOS. **[fetched]**
 https://github.com/tauri-apps/plugins-workspace/blob/v2/plugins/notification/src/desktop.rs
 (the desktop path even fakes the bundle id in dev: `set_application("com.apple.Terminal")`).
 
-Shipped work-arounds, both supported behind `notify::PromptPresenter`:
+Shipped work-arounds. **What is implemented today:** only path 1 —
+`notify::WindowPrompt` implements `notify::PromptPresenter`. Path 2 is a
+comment-only skeleton (`notify::un_center`) for the bundled build.
 1. **Custom always-on-top window** styled as a notification — works under `tauri
    dev`, no permissions, fully clickable. **[fetched]**
    https://github.com/pixelsmasher13/platypus/blob/main/src-tauri/src/engine/meeting_popup.rs
@@ -122,6 +124,12 @@ Shipped work-arounds, both supported behind `notify::PromptPresenter`:
    but requires a bundled signed .app; gate on `!tauri::is_dev()`. **[fetched]**
    https://github.com/indigoai-us/hq-desktop-app/blob/main/apps/sync/src-tauri/src/commands/un_notify.rs;
    https://github.com/ariso-ai/oats — `if !tauri::is_dev() { macos_un::show(...) }`.
+
+**Consent honesty:** the shipped *headless* daemon (`main.rs`) cannot show either
+surface — it has no UI/run-loop — so under `RecordPolicy::Prompt` it logs and does
+NOT record; only `RecordPolicy::Auto` records headlessly. The prompt surfaces belong
+to the Tauri shell. This is deliberate: silently auto-recording under a "prompt"
+policy would violate consent.
 
 ## 4. Auto-stop and save
 

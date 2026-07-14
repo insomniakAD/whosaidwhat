@@ -2,17 +2,21 @@
 //!
 //! Coordinates the user prompt, the recorder backend, and the detector's
 //! auto-stop, without touching any OS API — the actual audio I/O lives behind
-//! [`RecorderBackend`] (implemented by `capture::macos` with ScreenCaptureKit +
-//! a Core Audio input tap). Zero external dependencies so it unit-tests anywhere.
+//! [`RecorderBackend`] (implemented by `capture::macos` with ScreenCaptureKit
+//! for system audio + cpal for the mic, written as two separate tracks). Zero
+//! external dependencies so it unit-tests anywhere.
 
 use crate::detect::state::MeetingApp;
 
-/// Outcome of asking the backend to finalize a file.
+/// Outcome of asking the backend to finalize a recording. The two-track design
+/// (see capture::macos) yields two WAVs; both paths are carried explicitly so
+/// the pipeline never has to reconstruct one from the other by string surgery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SavedRecording {
-    /// Absolute path of the finalized audio file (WAV, 48 kHz stereo mix +
-    /// 16 kHz mono sidecar — see capture::macos for the exact artifacts).
-    pub path: String,
+    /// Absolute path of the system-audio track (remote participants), 48 kHz.
+    pub system_path: String,
+    /// Absolute path of the mic track (local user), if a mic track was written.
+    pub mic_path: Option<String>,
     /// Duration in milliseconds as reported by the backend.
     pub duration_ms: u64,
 }
@@ -88,8 +92,14 @@ impl<B: RecorderBackend> SessionManager<B> {
             }
             (SessionState::Idle, RecordPolicy::Auto) => self.start_recording(app, file_stem),
             (SessionState::Idle, RecordPolicy::Manual) => vec![],
-            // Already prompted/recording for another meeting: ignore overlaps.
-            // One recording at a time; the mixed system tap captures all audio anyway.
+            // Already prompted/recording for another meeting: one recording at a
+            // time. The single system-audio capture picks up ALL concurrent
+            // remote audio, so a second overlapping meeting is still captured
+            // acoustically; but if it OUTLIVES the current recording it must be
+            // re-offered. The detector's AppDetector for that app is already
+            // InMeeting and will not re-emit MeetingStarted, so the run loop
+            // re-checks Detector::active_meetings() whenever the session returns
+            // to Idle (see main.rs / Detector::active_meetings).
             _ => vec![],
         }
     }
@@ -193,7 +203,11 @@ mod tests {
         fn stop(&mut self) -> Result<SavedRecording, String> {
             assert!(self.recording, "stop while idle");
             self.recording = false;
-            Ok(SavedRecording { path: "/tmp/x.wav".into(), duration_ms: 1234 })
+            Ok(SavedRecording {
+                system_path: "/tmp/x.system.wav".into(),
+                mic_path: Some("/tmp/x.mic.wav".into()),
+                duration_ms: 1234,
+            })
         }
 
         fn is_recording(&self) -> bool {

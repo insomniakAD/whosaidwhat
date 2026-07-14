@@ -55,9 +55,15 @@ https://huggingface.co/Qwen/Qwen3.6-35B-A3B and quant cards:
   retention. The original pipeline's use of it on stateless single-shot calls was a
   no-op at best; the rewrite sends `chat_template_kwargs: {enable_thinking: false}`
   instead (thinking off = faster, and Qwen's non-thinking sampling profile applies).
-- Sampling (official card): non-thinking 0.7/0.80/presence 1.5; precise-format
-  0.6/0.95/0.0 → `SamplingProfile::{Prose, Strict}` in the router; extraction and
-  outline stages run Strict, the final rewrite runs Prose.
+- Sampling → `SamplingProfile::{Prose, Strict}` in the router; extraction/outline
+  run Strict, the final rewrite runs Prose. **Provenance, precisely:** the card's
+  non-thinking (instruct) profile is **[fetched]** 0.7 / 0.80 / presence 1.5 — that
+  is `Prose` exactly. `Strict`'s 0.6 / 0.95 / 0.0 is **[inference]**: the card
+  publishes 0.6/0.95/0.0 only as its *thinking-mode "precise coding"* profile, and
+  offers no non-thinking precise profile, so I adapted those numbers for
+  format-stable extraction with thinking disabled. It is a reasoned adaptation, not
+  official non-thinking guidance — do not cargo-cult it as Qwen's non-thinking
+  precise setting.
 
 **Memory budget on the 64 GB target (inference from fetched sizes):**
 ~21.6 GB Qwen weights + KV (small; DeltaNet) + ~1.7 GB whisper large-v3-turbo q5 +

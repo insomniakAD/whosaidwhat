@@ -86,7 +86,10 @@ apps foreground (Granola hides the transcript; Otter buries speakers in label ch
   notes are the primary surface, the raw transcript one tab away. Every takeaway
   carries a citation chip (`[02:14]`) that deep-links to the transcript row *and*
   seeks the audio player — the Notion Nov-2025 pattern, nearly free for us because
-  `segments` stores millisecond offsets (schema.sql).
+  `segments` stores millisecond offsets (schema.sql). *(Backend status: segment
+  offsets and the `summary_citations` table exist; structured citation extraction
+  is the next pipeline step — see docs/03 status note. Today the summarizer emits
+  `[mm:ss]` markers inline.)*
 - **Who-said-what rail** (the differentiator, inference): per-speaker talk-time bars,
   color-keyed dots reused in transcript speaker labels, click-to-rename (writes
   `speakers.display_name`), click-to-filter. Collapsible, answering Fathom users'

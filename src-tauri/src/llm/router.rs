@@ -22,10 +22,13 @@
 use super::client::{ChatMessage, ChatRequest, LlmError, OpenAiCompatClient};
 use std::collections::HashMap;
 
-/// Sampling profiles, from the official Qwen3.6 model card recommendations:
-/// non-thinking temperature=0.7 / top_p=0.8 / presence_penalty=1.5 for general
-/// text; temperature=0.6 / top_p=0.95 / presence_penalty=0.0 for strictly
-/// formatted output. (https://huggingface.co/Qwen/Qwen3.6-35B-A3B)
+/// Sampling profiles. `Prose` (0.7 / 0.8 / presence 1.5) is the Qwen3.6 card's
+/// official non-thinking (instruct) recommendation verbatim. `Strict`
+/// (0.6 / 0.95 / 0.0) is adapted from the card's *thinking-mode* "precise
+/// coding" profile for format-stable extraction with thinking disabled — the
+/// card has no non-thinking precise profile, so `Strict` is a reasoned choice,
+/// not official guidance. (https://huggingface.co/Qwen/Qwen3.6-35B-A3B; see
+/// docs/05 §2 for the provenance note.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SamplingProfile {
     /// Extraction / outline stages: keep it factual and format-stable.
@@ -68,7 +71,16 @@ impl Default for RouterConfig {
         RouterConfig {
             omlx_base_url: "http://localhost:8000/v1".into(),
             summarize_model: "Qwen3.6-35B-A3B-oQ4e-mtp".into(),
-            fallback_models: vec![],
+            // Gemma 4 is wired as a real fallback hook (Task 5): if the primary
+            // Qwen quant is not served by oMLX, the router uses the first
+            // available of these before falling back to any served model, and
+            // records the substitution in the summary's provenance columns.
+            // docs/05 §2 explains why Gemma 4 is a fallback here (not the ASR
+            // engine — its audio path caps at 30 s/request).
+            fallback_models: vec![
+                "gemma-4-12b-it-4bit".into(),
+                "Qwen3.6-35B-A3B-4bit".into(),
+            ],
         }
     }
 }

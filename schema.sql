@@ -42,6 +42,10 @@ CREATE INDEX IF NOT EXISTS idx_meetings_started_at ON meetings(started_at DESC);
 -- Speakers are first-class and global: the same human across many meetings.
 -- Diarization emits anonymous per-meeting labels; rows here are created lazily
 -- and merged when the user names them (Minutes' alias-merging pattern).
+-- NOTE: display_name is deliberately NOT UNIQUE. Anonymous labels (SPEAKER_00)
+-- recur across meetings as SEPARATE humans, so each meeting gets its own row
+-- (see db.rs resolve_speaker_id / store.py _speaker_id_for). Named speakers and
+-- the single is_self='Me' row are deduplicated in code, not by constraint.
 CREATE TABLE IF NOT EXISTS speakers (
     id               INTEGER PRIMARY KEY,
     display_name     TEXT NOT NULL,              -- 'SPEAKER_00' until user renames
@@ -123,6 +127,9 @@ CREATE TABLE IF NOT EXISTS summary_citations (
 );
 
 CREATE INDEX IF NOT EXISTS idx_citations_summary ON summary_citations(summary_id);
+-- Cover the child-side FK so cascading a meeting/segment delete does not scan
+-- the whole citations table per deleted segment (SQLite FK docs recommendation).
+CREATE INDEX IF NOT EXISTS idx_citations_segment ON summary_citations(segment_id);
 
 -- Action items extracted by stage 1/2, queryable across meetings.
 CREATE TABLE IF NOT EXISTS action_items (
@@ -136,6 +143,11 @@ CREATE TABLE IF NOT EXISTS action_items (
 );
 
 CREATE INDEX IF NOT EXISTS idx_action_items_open ON action_items(done, meeting_id);
+-- Cover the FK columns for cascade/SET NULL enforcement (the composite index
+-- above cannot serve a summary_id-only lookup, and meeting_id benefits from a
+-- dedicated index on delete).
+CREATE INDEX IF NOT EXISTS idx_action_items_meeting ON action_items(meeting_id);
+CREATE INDEX IF NOT EXISTS idx_action_items_summary ON action_items(summary_id);
 
 INSERT OR IGNORE INTO schema_migrations(version) VALUES (1);
 

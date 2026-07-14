@@ -13,6 +13,23 @@ use crate::llm::chunk::Turn;
 
 pub const SCHEMA_SQL: &str = include_str!("../../schema.sql");
 
+/// Turn arbitrary user input into a safe FTS5 MATCH expression.
+///
+/// FTS5's MATCH argument is a query language: bare `'`, `"`, `-`, `*`, `(`,
+/// `:`, and keywords like `NEAR`/`AND`/`OR` are syntax, so a user typing
+/// `don't` or `covid-19` triggers `fts5: syntax error` and the query fails.
+/// We split on whitespace and wrap each token as a quoted phrase (doubling
+/// embedded quotes), which makes every token a literal term ANDed together —
+/// the intuitive "results containing all these words" behavior. Empty input
+/// yields a query that matches nothing rather than erroring.
+pub fn fts5_sanitize(input: &str) -> String {
+    let tokens: Vec<String> = input
+        .split_whitespace()
+        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+        .collect();
+    tokens.join(" ")
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
     #[error("sqlite error: {0}")]
@@ -113,26 +130,36 @@ impl Store {
     }
 
     /// Store a full transcript in one transaction (all-or-nothing).
+    ///
+    /// Speaker-identity rules (mirroring pipeline/wsw/store.py so both writers
+    /// agree): "Me" (the mic track) is one global `is_self=1` row reused across
+    /// meetings; anonymous `SPEAKER_*` labels get a FRESH row per meeting (so
+    /// meeting A's SPEAKER_00 is never conflated with meeting B's — deduping
+    /// them by name is the cross-meeting-collision bug); any other (already
+    /// user-named) label dedups globally.
     pub fn insert_transcript(
         &mut self,
         meeting_id: &str,
         turns: &[(Turn, /*source:*/ &str)],
     ) -> Result<(), DbError> {
+        use std::collections::HashMap;
         let tx = self.conn.transaction()?;
         {
-            let mut ensure = tx.prepare(
-                "INSERT INTO speakers (display_name) \
-                 SELECT ?1 WHERE NOT EXISTS (SELECT 1 FROM speakers WHERE display_name = ?1)",
-            )?;
-            let mut lookup = tx.prepare("SELECT id FROM speakers WHERE display_name = ?1")?;
             let mut insert = tx.prepare(
                 "INSERT INTO segments (meeting_id, speaker_id, source, start_ms, end_ms, text) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?;
+            // Per-call cache of label -> speaker_id (keeps anonymous labels
+            // consistent WITHIN this meeting without leaking across meetings).
+            let mut cache: HashMap<String, i64> = HashMap::new();
             for (turn, source) in turns {
-                ensure.execute(params![turn.speaker])?;
-                let speaker_id: i64 =
-                    lookup.query_row(params![turn.speaker], |r| r.get(0))?;
+                let speaker_id = if let Some(id) = cache.get(&turn.speaker) {
+                    *id
+                } else {
+                    let id = Self::resolve_speaker_id(&tx, &turn.speaker)?;
+                    cache.insert(turn.speaker.clone(), id);
+                    id
+                };
                 insert.execute(params![
                     meeting_id,
                     speaker_id,
@@ -145,6 +172,36 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    fn resolve_speaker_id(conn: &rusqlite::Connection, label: &str) -> Result<i64, DbError> {
+        if label == "Me" {
+            if let Ok(id) = conn.query_row(
+                "SELECT id FROM speakers WHERE display_name = 'Me' AND is_self = 1",
+                [],
+                |r| r.get::<_, i64>(0),
+            ) {
+                return Ok(id);
+            }
+            conn.execute("INSERT INTO speakers (display_name, is_self) VALUES ('Me', 1)", [])?;
+            return Ok(conn.last_insert_rowid());
+        }
+        if label.starts_with("SPEAKER_") {
+            // Fresh per-meeting row (caller caches within the meeting).
+            conn.execute("INSERT INTO speakers (display_name) VALUES (?1)", params![label])?;
+            return Ok(conn.last_insert_rowid());
+        }
+        // Named speaker: global dedup.
+        conn.execute(
+            "INSERT INTO speakers (display_name) \
+             SELECT ?1 WHERE NOT EXISTS (SELECT 1 FROM speakers WHERE display_name = ?1)",
+            params![label],
+        )?;
+        Ok(conn.query_row(
+            "SELECT id FROM speakers WHERE display_name = ?1",
+            params![label],
+            |r| r.get(0),
+        )?)
     }
 
     /// Store a summary as the next version for (meeting, kind).
@@ -170,8 +227,13 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// FTS5 transcript search across all meetings, newest hits first.
+    /// FTS5 transcript search across all meetings, ranked best-first.
     pub fn search(&self, query: &str, limit: u32) -> Result<Vec<SearchHit>, DbError> {
+        let sanitized = fts5_sanitize(query);
+        if sanitized.is_empty() {
+            return Ok(Vec::new());
+        }
+        let query = &sanitized;
         let mut stmt = self.conn.prepare(
             "SELECT s.meeting_id, sp.display_name, s.start_ms, \
                     snippet(segments_fts, 0, '[', ']', '…', 12) \
@@ -259,5 +321,55 @@ mod tests {
         let a = store.ensure_speaker("Alice", false).unwrap();
         let b = store.ensure_speaker("Alice", false).unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn anonymous_speakers_do_not_collide_across_meetings() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.create_meeting("m1", "A", None, 1).unwrap();
+        store.create_meeting("m2", "B", None, 2).unwrap();
+        store.insert_transcript("m1", &[(turn("SPEAKER_00", "hi from m1", 0), "system")]).unwrap();
+        store.insert_transcript("m2", &[(turn("SPEAKER_00", "hi from m2", 0), "system")]).unwrap();
+        // Two distinct speaker rows despite the same display_name.
+        let count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM speakers WHERE display_name='SPEAKER_00'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 2, "each meeting's SPEAKER_00 must be its own row");
+    }
+
+    #[test]
+    fn self_speaker_is_single_and_marked() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.create_meeting("m1", "A", None, 1).unwrap();
+        store.create_meeting("m2", "B", None, 2).unwrap();
+        store.insert_transcript("m1", &[(turn("Me", "hi", 0), "mic")]).unwrap();
+        store.insert_transcript("m2", &[(turn("Me", "again", 0), "mic")]).unwrap();
+        let (count, is_self): (i64, i64) = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*), MAX(is_self) FROM speakers WHERE display_name='Me'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "one global self speaker across meetings");
+        assert_eq!(is_self, 1);
+    }
+
+    #[test]
+    fn search_tolerates_punctuation() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.create_meeting("m1", "A", None, 1).unwrap();
+        store
+            .insert_transcript("m1", &[(turn("Me", "we shipped covid-19 dashboards", 0), "mic")])
+            .unwrap();
+        // These would be FTS5 syntax errors unsanitized.
+        assert_eq!(store.search("covid-19", 10).unwrap().len(), 1);
+        assert!(store.search("don't", 10).unwrap().is_empty());
+        assert!(store.search("", 10).unwrap().is_empty());
+        assert!(store.search("   ", 10).unwrap().is_empty());
     }
 }

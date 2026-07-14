@@ -92,6 +92,13 @@ Key decisions:
 | Audio as paths | blobs in DB | screenpipe pattern; keeps DB small and Time-Machine-friendly |
 | `action_items` table | parsing markdown at query time | cross-meeting "what do I owe people" queries |
 
+**Implementation status (honest):** `meetings`, `speakers`, `segments`,
+`segments_fts`, and `summaries` are written by both the Rust (`db.rs`) and Python
+(`store.py`) paths today. `summary_citations` and `action_items` are schema-defined
+and indexed but **not yet populated** — the summarizer currently preserves `[mm:ss]`
+markers inline in the notes rather than extracting structured citation/action rows.
+Populating them is the next pipeline step, not a schema change.
+
 **D-011 (canonical store)** — Markdown-canonical (Minutes) was considered and
 rejected for v1: whosaidwhat's segments carry ms timestamps + speaker FKs + FTS,
 which lossy markdown round-trips poorly. Instead: SQLite is canonical, `summaries.content`

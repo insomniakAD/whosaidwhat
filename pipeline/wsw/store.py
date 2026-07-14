@@ -26,6 +26,56 @@ def open_store(db_path: str) -> sqlite3.Connection:
     return conn
 
 
+SELF_LABEL = "Me"
+
+
+def _speaker_id_for(
+    conn: sqlite3.Connection, meeting_id: str, label: str, self_row_id: dict
+) -> int:
+    """Resolve a per-turn speaker label to a speakers.id.
+
+    Speaker identity rules (matching schema.sql's design and the Rust path):
+    - the local user ("Me", the mic track) is a single global row, is_self=1,
+      reused across meetings and within this one;
+    - anonymous diarization labels (SPEAKER_00, ...) are per-meeting: a FRESH
+      row per meeting, so meeting A's SPEAKER_00 is never conflated with
+      meeting B's. Deduping these by display_name (the naive get-or-create)
+      is the cross-meeting-collision bug; we deliberately insert a new row.
+      The user renaming one later touches only that row.
+    - any other label (a real name the user already assigned) dedups globally.
+    """
+    if label == SELF_LABEL:
+        if self_row_id.get("id") is None:
+            row = conn.execute(
+                "SELECT id FROM speakers WHERE display_name = ? AND is_self = 1", (label,)
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO speakers (display_name, is_self) VALUES (?, 1)", (label,)
+                )
+                self_row_id["id"] = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            else:
+                self_row_id["id"] = row[0]
+        return self_row_id["id"]
+
+    if label.startswith("SPEAKER_"):
+        # Fresh per-meeting row; cache within this call so repeated turns of the
+        # same anonymous speaker in THIS meeting share one row.
+        cache_key = f"__anon__{label}"
+        if self_row_id.get(cache_key) is None:
+            conn.execute("INSERT INTO speakers (display_name) VALUES (?)", (label,))
+            self_row_id[cache_key] = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        return self_row_id[cache_key]
+
+    # Named speaker: global dedup.
+    conn.execute(
+        "INSERT INTO speakers (display_name) SELECT ? WHERE NOT EXISTS"
+        " (SELECT 1 FROM speakers WHERE display_name = ?)",
+        (label, label),
+    )
+    return conn.execute("SELECT id FROM speakers WHERE display_name = ?", (label,)).fetchone()[0]
+
+
 def save_meeting(
     conn: sqlite3.Connection,
     title: str,
@@ -51,22 +101,21 @@ def save_meeting(
             (meeting_id, title, app, now, audio_system_path, audio_mic_path),
         )
 
+        speaker_cache: dict = {}
         for turn in turns:
-            speaker = turn.get("speaker") or "Unknown"
+            label = turn.get("speaker") or "Unknown"
+            speaker_id = _speaker_id_for(conn, meeting_id, label, speaker_cache)
+            # The mic track ("Me") is the local user by construction; everything
+            # else came off the system track. Provenance must survive storage
+            # (schema.sql segments.source; docs/00 §2).
+            source = "mic" if label == SELF_LABEL else "system"
             conn.execute(
-                "INSERT INTO speakers (display_name) SELECT ? WHERE NOT EXISTS"
-                " (SELECT 1 FROM speakers WHERE display_name = ?)",
-                (speaker, speaker),
-            )
-            (speaker_id,) = conn.execute(
-                "SELECT id FROM speakers WHERE display_name = ?", (speaker,)
-            ).fetchone()
-            conn.execute(
-                "INSERT INTO segments (meeting_id, speaker_id, start_ms, end_ms, text)"
-                " VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO segments (meeting_id, speaker_id, source, start_ms, end_ms, text)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
                 (
                     meeting_id,
                     speaker_id,
+                    source,
                     turn.get("start_ms", 0),
                     turn.get("end_ms", turn.get("start_ms", 0)),
                     turn.get("text", ""),
@@ -95,8 +144,23 @@ def save_meeting(
     return meeting_id
 
 
+def fts5_sanitize(query: str) -> str:
+    """Turn arbitrary user input into a safe FTS5 MATCH expression.
+
+    Mirrors db::fts5_sanitize in the Rust path: each whitespace token becomes a
+    quoted phrase (embedded quotes doubled), so punctuation like `don't` or
+    `covid-19` is treated literally instead of raising `fts5: syntax error`.
+    Empty input returns "" and the caller short-circuits to no results.
+    """
+    tokens = query.split()
+    return " ".join('"' + t.replace('"', '""') + '"' for t in tokens)
+
+
 def search(conn: sqlite3.Connection, query: str, limit: int = 20) -> list[dict]:
     """FTS5 transcript search across all stored meetings."""
+    match = fts5_sanitize(query)
+    if not match:
+        return []
     rows = conn.execute(
         "SELECT s.meeting_id, sp.display_name, s.start_ms,"
         " snippet(segments_fts, 0, '[', ']', '…', 12)"
@@ -104,7 +168,7 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 20) -> list[dict]:
         " JOIN segments s ON s.id = segments_fts.rowid"
         " LEFT JOIN speakers sp ON sp.id = s.speaker_id"
         " WHERE segments_fts MATCH ? ORDER BY rank LIMIT ?",
-        (query, limit),
+        (match, limit),
     ).fetchall()
     return [
         {"meeting_id": m, "speaker": sp, "start_ms": ms, "snippet": snip}

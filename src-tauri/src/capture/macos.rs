@@ -25,7 +25,8 @@
 //!   `hound` writers are flushed per buffer and the header finalized in
 //!   `stop()`. 48 kHz f32 as captured; the pipeline downmixes/resamples to
 //!   16 kHz mono for ASR/diarization (whisper.cpp and pyannote-family models
-//!   both require 16 kHz mono — see pipeline/wsw/audio.py).
+//!   both require 16 kHz mono — see `crate::pipeline::load_wav_16k_mono` for the
+//!   Rust path and `pipeline/wsw/transcribe.py` for the Python one).
 //!
 //! Permissions (Info.plist): `NSMicrophoneUsageDescription` (mic) and the
 //! Screen Recording grant (SCK). Both are user-facing one-time grants; macOS
@@ -187,14 +188,21 @@ impl<S: SystemAudioSource> RecorderBackend for MacRecorder<S> {
         drop(rec.mic_stream.take()); // cpal stream stops on drop
         self.system_source.stop()?;
 
-        for writer in [&rec.mic_writer, &rec.sys_writer] {
-            if let Some(w) = writer.lock().unwrap().take() {
-                w.finalize().map_err(|e| CaptureError::Wav(e.to_string()))?;
-            }
+        let mut mic_written = false;
+        if let Some(w) = rec.mic_writer.lock().unwrap().take() {
+            w.finalize().map_err(|e| CaptureError::Wav(e.to_string()))?;
+            mic_written = true;
+        }
+        if let Some(w) = rec.sys_writer.lock().unwrap().take() {
+            w.finalize().map_err(|e| CaptureError::Wav(e.to_string()))?;
         }
 
+        let system_path = rec.stem_path.with_extension("system.wav").display().to_string();
+        let mic_path = mic_written
+            .then(|| rec.stem_path.with_extension("mic.wav").display().to_string());
         Ok(SavedRecording {
-            path: rec.stem_path.with_extension("system.wav").display().to_string(),
+            system_path,
+            mic_path,
             duration_ms: rec.started.elapsed().as_millis() as u64,
         })
     }
@@ -221,7 +229,7 @@ impl SckSystemAudio {
 }
 
 impl SystemAudioSource for SckSystemAudio {
-    fn start(&mut self, mut sink: Box<dyn FnMut(&[f32]) + Send>) -> Result<(), CaptureError> {
+    fn start(&mut self, sink: Box<dyn FnMut(&[f32]) + Send>) -> Result<(), CaptureError> {
         use screencapturekit::shareable_content::SCShareableContent;
         use screencapturekit::stream::configuration::SCStreamConfiguration;
         use screencapturekit::stream::content_filter::SCContentFilter;
@@ -229,21 +237,44 @@ impl SystemAudioSource for SckSystemAudio {
         use screencapturekit::stream::output_type::SCStreamOutputType;
         use screencapturekit::stream::SCStream;
 
-        struct AudioOut<F: FnMut(&[f32]) + Send> {
-            sink: F,
+        // The SCK output handler is invoked on SCK's own dispatch queue, so the
+        // trait method takes &self and the handler must be Send + Sync + 'static.
+        // The FnMut sink therefore lives behind a Mutex (interior mutability),
+        // and a scratch buffer is reused to interleave channels without
+        // per-callback allocation.
+        struct AudioOut {
+            sink: std::sync::Mutex<Box<dyn FnMut(&[f32]) + Send>>,
+            scratch: std::sync::Mutex<Vec<f32>>,
         }
-        impl<F: FnMut(&[f32]) + Send> SCStreamOutputTrait for AudioOut<F> {
+        impl SCStreamOutputTrait for AudioOut {
             fn did_output_sample_buffer(
-                &mut self,
+                &self,
                 sample: screencapturekit::output::CMSampleBuffer,
                 of_type: SCStreamOutputType,
             ) {
-                if matches!(of_type, SCStreamOutputType::Audio) {
-                    if let Ok(buffers) = sample.get_audio_buffer_list() {
-                        for buf in buffers.iter() {
-                            (self.sink)(buf.as_f32_slice());
-                        }
+                if !matches!(of_type, SCStreamOutputType::Audio) {
+                    return;
+                }
+                let Ok(buffers) = sample.get_audio_buffer_list() else { return };
+                let channels: Vec<&[f32]> = buffers.iter().map(|b| b.as_f32_slice()).collect();
+                if channels.is_empty() {
+                    return;
+                }
+                // SCK delivers PLANAR audio: one AudioBuffer per channel. The
+                // WAV writer expects interleaved frames, so zip the channels
+                // (L,R,L,R,...). Writing each planar buffer straight through
+                // would scramble the file into [all-L][all-R].
+                let frames = channels.iter().map(|c| c.len()).min().unwrap_or(0);
+                let mut interleaved = self.scratch.lock().unwrap();
+                interleaved.clear();
+                interleaved.reserve(frames * channels.len());
+                for f in 0..frames {
+                    for ch in &channels {
+                        interleaved.push(ch[f]);
                     }
+                }
+                if let Ok(mut sink) = self.sink.lock() {
+                    (sink)(&interleaved);
                 }
             }
         }
@@ -266,7 +297,7 @@ impl SystemAudioSource for SckSystemAudio {
 
         let mut stream = SCStream::new(&filter, &config);
         stream.add_output_handler(
-            AudioOut { sink: move |data: &[f32]| sink(data) },
+            AudioOut { sink: std::sync::Mutex::new(sink), scratch: std::sync::Mutex::new(Vec::new()) },
             SCStreamOutputType::Audio,
         );
         stream

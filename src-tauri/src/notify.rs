@@ -9,10 +9,13 @@
 //!
 //! - [`WindowPrompt`]: a small always-on-top Tauri window styled like a native
 //!   notification. Works in `tauri dev`, needs no permissions, fully clickable.
-//! - [`UnNotificationPrompt`] (bundled builds): `UNUserNotificationCenter` via
-//!   objc2 with a notification category carrying Start/Dismiss actions and a
-//!   delegate to receive the response. Requires a signed, bundled .app —
-//!   gate on `!tauri::is_dev()`.
+//!   This is the only presenter that implements [`PromptPresenter`] today.
+//! - The `un_center` module (bundled builds): a skeleton for the
+//!   `UNUserNotificationCenter` path via objc2 — a notification category
+//!   carrying Start/Dismiss actions plus a delegate. It is intentionally
+//!   comment-only until the app has a signed .app bundle (calling UN APIs from
+//!   an unbundled binary aborts the process); finish it gated on
+//!   `!tauri::is_dev()`.
 //!
 //! The prompt is one honest question with two outcomes; everything else
 //! (auto-record policy, manual start) bypasses it entirely.

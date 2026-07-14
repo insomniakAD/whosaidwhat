@@ -101,12 +101,21 @@ def get_transcript(meeting_id: str, db_path: str = DEFAULT_DB_PATH) -> list[Turn
             "WHERE meeting_id = ? ORDER BY timestamp ASC",
             (meeting_id,),
         ).fetchall()
+        # Meetily stores no per-turn millisecond offsets, so we synthesize a
+        # monotonically increasing sequence (1 s apart) purely to PRESERVE ORDER
+        # in whosaidwhat's segments table (which renders ORDER BY start_ms). These
+        # are ordering keys, NOT real audio positions — audio deep-links are
+        # therefore unavailable for Meetily-imported meetings (documented in
+        # docs/04). A future improvement is parsing Meetily's timestamp column
+        # into real offsets, but its format is not guaranteed across releases.
         return [
             Turn(
                 speaker=(row["speaker"] or "Unknown"),
                 text=row["transcript"] or "",
+                start_ms=i * 1000,
+                end_ms=i * 1000,
             )
-            for row in rows
+            for i, row in enumerate(rows)
         ]
     finally:
         conn.close()

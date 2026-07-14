@@ -9,7 +9,8 @@ oMLX summarization endpoint**, with everything on-device.
                         macOS
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  DETECT (src/detect)                          always-on, ~0 CPU at idle │
-│  NSWorkspace launch/quit events ──gate──► poll loop (2s active/15s idle)│
+│  poll loop (2s active / 15s idle) — source of truth;                    │
+│  NSWorkspace launch/quit events tighten cadence in the Tauri shell      │
 │    signals per app:  Zoom: CptHost process (exact match)                │
 │                      Teams: MSTeams + mic-in-use                        │
 │                      Meet: browser + meet.google.com/<code> tab + mic   │
@@ -66,8 +67,11 @@ Capture writes **mic** and **system** audio separately instead of mixing:
    the clean system track; near-duplicates on the mic track lose the overlap vote.
 3. **Attribution survives storage** — `segments.source` ('mic'/'system').
 
-Hyprnote ships the same shape (its mic input filters out its own system tap device);
-Meetily runs a 48 kHz two-source pipeline. [search-verified in docs/02/04 sources]
+Hyprnote ships the same shape — its `hypr-audio` mic input filters out its own
+system-audio tap device to avoid recursive capture **[search-verified]**
+https://github.com/fastrepl/hyprnote (via https://deepwiki.com/fastrepl/hyprnote) —
+and Meetily runs a 48 kHz two-source capture pipeline **[search-verified]**
+https://github.com/Zackriya-Solutions/meeting-minutes.
 
 ## 3. Trust boundaries & failure behavior
 

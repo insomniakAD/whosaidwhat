@@ -41,12 +41,19 @@ sherpa-rs = { version = "0.6", optional = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 block2 = "0.6"
-objc2-foundation = "0.3"
-objc2-app-kit = { version = "0.3", features = ["NSWorkspace", "NSRunningApplication"] }
+# addObserverForName_object_queue_usingBlock + NSNotification are feature-gated
+# on objc2-foundation; the NSWorkspace feature of objc2-app-kit does not pull
+# them in transitively.
+objc2-foundation = { version = "0.3", features = ["NSNotification", "NSString", "NSOperation", "block2"] }
+objc2-app-kit = { version = "0.3", features = ["NSWorkspace", "NSRunningApplication", "block2"] }
 # CoreAudio property listeners for the mic-in-use signal.
 coreaudio-sys = "0.2"
 # Mic capture; system audio comes from ScreenCaptureKit (see capture::macos).
 cpal = "0.15"
-screencapturekit = "0.3"
+# capture::macos targets the rewritten API (SCStream::new(&filter,&config) +
+# add_output_handler + SCStreamOutputTrait), which is the 1.x line of the
+# doom-fish crate — NOT the 0.3.x API (sc_stream/StreamOutput/struct-literal
+# config). Pin to 1.x accordingly.
+screencapturekit = "1"
 
 [dev-dependencies]

@@ -28,10 +28,10 @@ mod macos_main {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use whosaidwhat::capture::macos::{MacRecorder, SckSystemAudio};
-    use whosaidwhat::capture::session::{RecordPolicy, SessionEffect, SessionManager};
+    use whosaidwhat::capture::session::{RecordPolicy, SessionEffect, SessionManager, SessionState};
     use whosaidwhat::config::Config;
     use whosaidwhat::db::Store;
-    use whosaidwhat::detect::state::DetectorEvent;
+    use whosaidwhat::detect::state::{DetectorEvent, MeetingApp};
     use whosaidwhat::detect::{macos::MacSignalSource, Detector};
     use whosaidwhat::llm::router::InferenceRouter;
 
@@ -58,42 +58,61 @@ mod macos_main {
 
         loop {
             for event in detector.tick() {
-                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
                 match event {
                     DetectorEvent::MeetingStarted(app) => {
-                        let stem = format!(
-                            "{}-{}",
-                            app.display_name().to_lowercase().replace(' ', "-"),
-                            now
-                        );
-                        // Headless build applies the policy directly; the Tauri
-                        // shell shows notify::WindowPrompt here instead.
-                        let effects = session.on_meeting_started(app.clone(), &stem);
-                        let effects = if effects
-                            .iter()
-                            .any(|e| matches!(e, SessionEffect::PromptUser { .. }))
-                        {
-                            tracing::info!("meeting detected in {}", app.display_name());
-                            session.on_user_accept(&stem)
-                        } else {
-                            effects
-                        };
-                        handle_effects(&mut store, &router, &runtime, effects, now);
+                        let effects = start_for(&mut session, &app);
+                        handle_effects(&mut store, &router, &runtime, effects);
                     }
                     DetectorEvent::MeetingEnded(app) => {
                         let effects = session.on_meeting_ended(&app);
-                        handle_effects(&mut store, &router, &runtime, effects, now);
+                        handle_effects(&mut store, &router, &runtime, effects);
+                        // A concurrent meeting may have been ignored while this
+                        // one recorded; if the session is now free, re-offer any
+                        // app still in a meeting (the detector won't re-emit).
+                        if session.state() == SessionState::Idle {
+                            for other in detector.active_meetings() {
+                                let effects = start_for(&mut session, &other);
+                                handle_effects(&mut store, &router, &runtime, effects);
+                                if session.state() != SessionState::Idle {
+                                    break; // one recording at a time
+                                }
+                            }
+                        }
                     }
-                    DetectorEvent::AppLaunched(app) => {
-                        tracing::debug!("{} launched", app.display_name());
-                    }
-                    DetectorEvent::AppQuit(app) => {
-                        tracing::debug!("{} quit", app.display_name());
-                    }
+                    DetectorEvent::AppLaunched(app) => tracing::debug!("{} launched", app.display_name()),
+                    DetectorEvent::AppQuit(app) => tracing::debug!("{} quit", app.display_name()),
                 }
             }
             std::thread::sleep(detector.next_poll_interval());
         }
+    }
+
+    /// Apply the record policy to a detected meeting.
+    ///
+    /// Consent note: under `RecordPolicy::Prompt` the headless daemon has no UI
+    /// to show a notification, so it does NOT record — it logs and waits. Only
+    /// `RecordPolicy::Auto` records without a UI. The Tauri shell replaces this
+    /// function's Prompt branch with `notify::WindowPrompt`, which shows the
+    /// clickable "Start recording?" surface and calls `session.on_user_accept`
+    /// on click. Silently auto-recording under Prompt would violate consent.
+    fn start_for(
+        session: &mut SessionManager<MacRecorder<SckSystemAudio>>,
+        app: &MeetingApp,
+    ) -> Vec<SessionEffect> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let stem = format!("{}-{}", app.display_name().to_lowercase().replace(' ', "-"), now);
+        let effects = session.on_meeting_started(app.clone(), &stem);
+        if effects.iter().any(|e| matches!(e, SessionEffect::PromptUser { .. })) {
+            tracing::info!(
+                "{} meeting detected — Prompt policy needs the app UI to consent; \
+                 set record_policy=\"auto\" for headless capture. Not recording.",
+                app.display_name()
+            );
+            // Clear the prompt state we just entered (no UI will answer it).
+            session.on_user_decline();
+            return vec![];
+        }
+        effects
     }
 
     fn handle_effects(
@@ -101,38 +120,51 @@ mod macos_main {
         router: &InferenceRouter,
         runtime: &tokio::Runtime,
         effects: Vec<SessionEffect>,
-        now: i64,
     ) {
         for effect in effects {
             match effect {
                 SessionEffect::RecordingSaved { app, saved } => {
-                    tracing::info!("recording saved: {} ({} ms)", saved.path, saved.duration_ms);
-                    let meeting_id = format!("mtg-{now}");
+                    tracing::info!(
+                        "recording saved: {} ({} ms)",
+                        saved.system_path,
+                        saved.duration_ms
+                    );
+                    let end = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+                    // start = end - duration; nanos make the id collision-proof
+                    // even for two recordings finishing in the same second.
+                    let started_at = (end.as_secs() as i64) - (saved.duration_ms / 1000) as i64;
+                    let meeting_id = format!("mtg-{}", end.as_nanos());
                     let app_key = app.display_name().to_lowercase().replace(' ', "-");
                     if let Err(e) = store.create_meeting(
                         &meeting_id,
                         &format!("{} meeting", app.display_name()),
                         Some(&app_key),
-                        now,
+                        started_at,
                     ) {
                         tracing::error!("db: {e}");
                         continue;
                     }
-                    let system = std::path::PathBuf::from(&saved.path);
-                    let mic = system.with_extension("").with_extension("mic.wav");
+                    let system = std::path::PathBuf::from(&saved.system_path);
+                    let mic = saved.mic_path.as_ref().map(std::path::PathBuf::from);
                     let _ = store.set_meeting_audio(
                         &meeting_id,
-                        Some(&saved.path),
-                        mic.exists().then(|| mic.display().to_string()).as_deref(),
-                        now,
+                        Some(&saved.system_path),
+                        saved.mic_path.as_deref(),
+                        end.as_secs() as i64,
                     );
 
                     // ASR + diarization models load lazily per recording; on
                     // 64 GB the ~2 GB whisper + ~50 MB diarization models could
                     // stay resident, but cold-loading keeps the daemon's idle
                     // footprint near zero and adds only seconds.
+                    //
+                    // Known limitation (documented in docs/00 §3): this blocks
+                    // the detection thread for the pipeline's duration, so a
+                    // meeting starting mid-processing is detected late. The
+                    // Tauri shell runs the pipeline on a background task with
+                    // its own DB connection (WAL allows the concurrent writer).
                     let result = runtime.block_on(async {
-                        run_pipeline(store, router, &meeting_id, &system, &mic).await
+                        run_pipeline(store, router, &meeting_id, &system, mic.as_deref()).await
                     });
                     match result {
                         Ok(summary_id) => {
@@ -156,7 +188,7 @@ mod macos_main {
         router: &InferenceRouter,
         meeting_id: &str,
         system_wav: &std::path::Path,
-        mic_wav: &std::path::Path,
+        mic_wav: Option<&std::path::Path>,
     ) -> anyhow::Result<i64> {
         let config = Config::load_or_default(&Config::default().data_dir.join("config.json"));
 
@@ -188,7 +220,7 @@ mod macos_main {
                 &mut transcriber,
                 &mut diarizer,
                 meeting_id,
-                mic_wav.exists().then_some(mic_wav),
+                mic_wav.filter(|p| p.exists()),
                 system_wav,
                 &mut progress,
             )

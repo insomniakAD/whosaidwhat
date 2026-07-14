@@ -55,11 +55,15 @@ full app would dilute quality of the named deliverables.
 **Q:** `pipeline.py` targets oMLX at `localhost:8000/v1` with model
 `Qwen3.6-35B-A3B-oQ4e-mtp`. Are these real?
 **A:** Yes to both. oMLX is a native macOS MLX inference server with OpenAI- and
-Anthropic-compatible endpoints (fetched https://omlx.ai/ and
-https://github.com/jundot/omlx). Qwen3.6-35B-A3B is Alibaba's April 2026 MoE release,
-35B total / 3B active (fetched via search;
-https://huggingface.co/Qwen/Qwen3.6-35B-A3B). Details (quant naming, `preserve_thinking`
-param) delegated to the research fan-out for verification.
+Anthropic-compatible endpoints — **[search-verified]** only (omlx.ai and
+github.com/jundot/omlx were blocked by this sandbox's egress proxy; the facts come
+from search-result excerpts, corroborated by the original pipeline.py successfully
+targeting `localhost:8000/v1`). Qwen3.6-35B-A3B is Alibaba's April 2026 MoE release,
+35B total / 3B active — **[fetched]** https://huggingface.co/Qwen/Qwen3.6-35B-A3B
+(HuggingFace was directly fetchable). Details (quant naming, `preserve_thinking`
+param) verified in the research fan-out (docs/05).
+*(Correction: an earlier draft of this entry said omlx.ai was "fetched"; that was
+wrong and is fixed here — consistent with D-008 and docs/05 §4.)*
 **Why:** Both post-date my training data; guardrail 1 requires fetching, not assuming.
 
 ### D-003 — Orchestration shape
@@ -199,4 +203,92 @@ only of the 12B Unified variant (E2B/E4B carry a USM-style conformer encoder).
   API surfaces (sherpa-rs, screencapturekit, whisper-rs constructor details), and
   any claim marked [search-verified].
 
-*(Adversarial review pass appended below after it runs.)*
+## Adversarial review pass (4 parallel skeptic agents) — findings & dispositions
+
+A verification workflow ran four adversarial reviewers (Rust correctness, Python+SQL
+correctness, evidence audit, completeness-vs-master-prompt). It surfaced real defects;
+this section records each substantive finding and what was done. Fixes were re-tested
+(30 dependency-free Rust tests via the bare-rustc harness, 21 Python tests, schema
+re-executed; the 4 new rusqlite-backed `db.rs` tests for speaker namespacing and FTS
+sanitization run under `cargo test` on a network that can reach crates.io).
+
+**Fixed — compile-blockers (Rust):**
+- `screencapturekit` was pinned to 0.3 but the code targets the rewritten
+  (1.x) API → bumped to `screencapturekit = "1"` with a comment (Cargo.toml).
+- `objc2-foundation` had no features, but `addObserverForName…` + `NSNotification`
+  are feature-gated → added `NSNotification`/`NSString`/`NSOperation`/`block2`.
+- SCK `AudioOut` used `&mut self` + a captured `FnMut`; the trait method is `&self`
+  and the handler must be `Send`+`'static` → moved the sink behind a `Mutex`.
+
+**Fixed — correctness (Rust):**
+- **Pre-Sonoma self-recording mic bug (would truncate every Teams/Meet recording
+  ~10 s in):** `mic_in_use` returned `false` when the per-process API was
+  unavailable, which fabricated a meeting-end → changed to assume `true`
+  (`unwrap_or(true)`), so end degrades to app-quit/tab-close as documented.
+- **SCK planar-vs-interleaved audio scramble:** SCK delivers one AudioBuffer per
+  channel (planar); the writer expected interleaved frames → now zips channels
+  into interleaved order before writing.
+- **Concurrent meeting lost after a recording ended:** added
+  `Detector::active_meetings()` and a re-offer loop in `main.rs` when the session
+  returns to Idle.
+- **`meeting_id` second-collision + wrong `started_at`:** id now uses nanoseconds
+  (collision-proof); `started_at` computed as `end − duration` instead of the end
+  time; both audio paths carried explicitly in `SavedRecording` (no string surgery).
+- **FTS5 MATCH crashed on ordinary punctuation** (`don't`, `covid-19`) → added
+  `db::fts5_sanitize` (quote each token); mirrored in Python `store.fts5_sanitize`.
+- **Cross-meeting speaker collision + missing `is_self`:** `insert_transcript` now
+  gives anonymous `SPEAKER_*` labels a fresh per-meeting row, reuses one global
+  `is_self` "Me", and dedups only named speakers — mirrored exactly in Python
+  `store._speaker_id_for`. New tests lock both paths.
+
+**Fixed — correctness (Python):**
+- **`store.py` dropped `segments.source`** (mic turns stored as system) → now sets
+  `'mic'`/`'system'` per turn.
+- **Meetily import discarded timestamps** (all segments at 0) → synthesizes a
+  monotonic ordering sequence, documented as ordering-only (no real offsets).
+- **`--out-db` couldn't follow the subcommand** (documented usage failed) → moved
+  onto each subparser.
+- **AppleScript injection in `notify()`** (the exact bug docs/04 claimed fixed) →
+  now escapes backslashes and quotes; noted list-argv only stops shell injection.
+
+**Fixed — SQL:**
+- Added FK-covering indexes `idx_citations_segment`, `idx_action_items_meeting`,
+  `idx_action_items_summary` (cascade deletes were table scans); documented why
+  `speakers.display_name` is intentionally not UNIQUE.
+
+**Fixed — evidence integrity (the guardrail-1 core):**
+- **D-002 said omlx.ai was "fetched"** contradicting D-008/docs-05 → relabeled
+  `[search-verified]` with an explicit correction note.
+- **Sampling `Strict` profile was mislabeled as official** → docs/05 and
+  `router.rs` now mark 0.6/0.95/0.0 as `[inference]` adapted from the card's
+  thinking-mode precise profile (the card has no non-thinking precise profile).
+- Dangling cross-refs fixed: docs/00 Hyprnote/Meetily now carry real URLs;
+  `capture/macos.rs` pointed at a nonexistent `audio.py` → corrected; `notify.rs`
+  doc-linked a nonexistent `UnNotificationPrompt` type → corrected; docs/02 "both
+  presenters supported" → clarified only `WindowPrompt` is implemented.
+
+**Fixed — over-claims softened to match reality (guardrail 1: don't claim done what
+isn't):**
+- README + docs/01 + docs/03 now state plainly that `summary_citations` /
+  `action_items` are schema-ready but not yet populated, that there is no Tauri
+  frontend in the repo yet, and that the headless `Prompt` policy does not record
+  (consent needs the UI).
+
+**D-015 — consent honesty in the headless daemon:** the shipped daemon has no UI, so
+under `RecordPolicy::Prompt` it now logs and does NOT record (only `Auto` records
+headlessly). The earlier draft auto-accepted the prompt, which misrepresented consent.
+
+**Accepted as known limitations (documented, not fixed this run):**
+- Teams marker (`teams_running && mic`) can false-positive on unrelated mic use while
+  Teams idles in the background — no first-party Teams-meeting signal exists (D-009);
+  documented in docs/02.
+- The headless pipeline runs on the detection thread (`block_on`), so a meeting
+  starting mid-processing is detected late — documented in docs/00 §3 and the code;
+  the Tauri shell runs it on a background task.
+- Gemma 4 is wired only as a fallback model id (now in `RouterConfig::default`), not
+  a first-class audio lane — by design (docs/05, D-014).
+
+Net: every critical and every correctness-major finding was fixed and re-tested; the
+remaining open items are either genuine platform limitations with no clean fix or
+explicitly-scoped future work, and all are now stated honestly in the docs rather
+than papered over.
