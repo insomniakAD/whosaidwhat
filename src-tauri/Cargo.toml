@@ -13,12 +13,27 @@ path = "src/lib.rs"
 name = "whosaidwhat"
 path = "src/main.rs"
 
+# The Tauri desktop shell. Kept behind `required-features` so the default
+# `cargo test` / headless-daemon builds never pull the Tauri (webview) stack —
+# on Linux CI that stack needs system webkit2gtk packages.
+[[bin]]
+name = "whosaidwhat-app"
+path = "src/bin/app.rs"
+required-features = ["shell"]
+
 [features]
 default = ["asr-whisper", "diarize-sherpa"]
 # Native ASR via whisper.cpp (Metal on Apple Silicon).
 asr-whisper = ["dep:whisper-rs"]
 # Native diarization via sherpa-onnx (pyannote segmentation-3.0 ONNX + speaker embeddings).
 diarize-sherpa = ["dep:sherpa-rs"]
+# Tauri v2 desktop shell (dashboard, prompt window, recording pill, tray).
+# Build: `cargo build --features shell --bin whosaidwhat-app` (build.rs runs
+# tauri-build only when this feature is on), or `tauri dev/build` with the
+# feature enabled. `tray-icon` must be explicit because the tray is built in
+# Rust code, not via a `trayIcon` config entry (the feature is only
+# auto-enabled by config; see docs.rs/crate/tauri feature list).
+shell = ["dep:tauri"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -37,14 +52,36 @@ hound = "3.5"
 
 whisper-rs = { version = "0.14", features = ["metal"], optional = true }
 sherpa-rs = { version = "0.6", optional = true }
+# Tauri v2 (see docs/00 §Wiring). `tray-icon` per the feature-list note above;
+# `image-png` so the tray can load the bundled PNG icon at runtime.
+tauri = { version = "2", features = ["tray-icon", "image-png"], optional = true }
+
+[build-dependencies]
+# Unconditional (build scripts cannot cfg away a missing crate), but build.rs
+# only *runs* tauri_build::build() when the `shell` feature is enabled
+# (CARGO_FEATURE_SHELL). tauri-build is pure Rust — no webkit system deps.
+tauri-build = { version = "2", features = [] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 block2 = "0.6"
 # addObserverForName_object_queue_usingBlock + NSNotification are feature-gated
 # on objc2-foundation; the NSWorkspace feature of objc2-app-kit does not pull
-# them in transitively.
-objc2-foundation = { version = "0.3", features = ["NSNotification", "NSString", "NSOperation", "block2"] }
+# them in transitively. NSArray/NSSet/NSError/NSBundle serve notify::un_center.
+objc2-foundation = { version = "0.3", features = [
+    "NSNotification", "NSString", "NSOperation", "block2",
+    "NSArray", "NSSet", "NSError", "NSBundle", "NSEnumerator", "NSURL",
+] }
+# UNUserNotificationCenter path (notify::un_center). One feature per framework
+# header, objc2 convention; the set below covers center/content/request/
+# response/action/category (feature↔type mapping verified against the
+# generated crate's cfg gates — see docs/02 §Notifications sources).
+objc2-user-notifications = { version = "0.3", default-features = false, features = [
+    "std", "block2", "bitflags",
+    "UNUserNotificationCenter", "UNNotificationContent", "UNNotificationRequest",
+    "UNNotificationTrigger", "UNNotificationResponse", "UNNotificationAction",
+    "UNNotificationCategory",
+] }
 objc2-app-kit = { version = "0.3", features = ["NSWorkspace", "NSRunningApplication", "block2"] }
 # CoreAudio property listeners for the mic-in-use signal.
 coreaudio-sys = "0.2"

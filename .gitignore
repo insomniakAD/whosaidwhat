@@ -12,9 +12,11 @@ venv/
 # macOS
 .DS_Store
 
-# Node / Tauri frontend
+# Node / Tauri
+# NOTE: /dist is NOT ignored — the frontend is hand-written static HTML/CSS/JS
+# (no bundler), so dist/ is source, not build output.
 node_modules/
-dist/
+src-tauri/gen/
 
 # Local artifacts
 *.sqlite

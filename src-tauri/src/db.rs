@@ -41,12 +41,68 @@ pub struct Store {
 }
 
 /// A transcript search hit (FTS5 snippet + jump-to-audio position).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct SearchHit {
     pub meeting_id: String,
     pub speaker: Option<String>,
     pub start_ms: u64,
     pub snippet: String,
+}
+
+/// One transcript segment with DB identity (citation resolution + UI).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct SegmentRow {
+    pub id: i64,
+    pub speaker_id: Option<i64>,
+    pub speaker: String,
+    pub source: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct MeetingRow {
+    pub id: String,
+    pub title: String,
+    pub app: Option<String>,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct CitationRow {
+    pub segment_id: i64,
+    pub quote: Option<String>,
+    pub start_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct SummaryRow {
+    pub id: i64,
+    pub version: i64,
+    pub kind: String,
+    pub content: String,
+    pub model: String,
+    pub model_was_fallback: bool,
+    pub citations: Vec<CitationRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ActionItemRow {
+    pub id: i64,
+    pub text: String,
+    pub done: bool,
+    pub owner: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct SpeakerStat {
+    pub speaker_id: i64,
+    pub display_name: String,
+    pub is_self: bool,
+    pub talk_ms: u64,
 }
 
 impl Store {
@@ -254,6 +310,221 @@ impl Store {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Transcript rows with their DB identities (for citation resolution and
+    /// the UI's transcript pane; `transcript()` below stays the LLM-facing
+    /// view that needs no ids).
+    pub fn segments_for_meeting(&self, meeting_id: &str) -> Result<Vec<SegmentRow>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.speaker_id, COALESCE(sp.display_name, 'Unknown'), s.source, \
+                    s.start_ms, s.end_ms, s.text \
+             FROM segments s LEFT JOIN speakers sp ON sp.id = s.speaker_id \
+             WHERE s.meeting_id = ?1 ORDER BY s.start_ms ASC",
+        )?;
+        let rows = stmt.query_map(params![meeting_id], |r| {
+            Ok(SegmentRow {
+                id: r.get(0)?,
+                speaker_id: r.get(1)?,
+                speaker: r.get(2)?,
+                source: r.get(3)?,
+                start_ms: r.get::<_, i64>(4)? as u64,
+                end_ms: r.get::<_, i64>(5)? as u64,
+                text: r.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Store resolved citation links for a summary (idempotent per call site:
+    /// the pipeline writes them once, right after inserting the summary).
+    pub fn insert_citations(
+        &mut self,
+        summary_id: i64,
+        citations: &[(i64, Option<String>)],
+    ) -> Result<usize, DbError> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut insert = tx.prepare(
+                "INSERT INTO summary_citations (summary_id, segment_id, quote) \
+                 VALUES (?1, ?2, ?3)",
+            )?;
+            for (segment_id, quote) in citations {
+                insert.execute(params![summary_id, segment_id, quote])?;
+            }
+        }
+        tx.commit()?;
+        Ok(citations.len())
+    }
+
+    /// Store extracted action items. `items` pairs an optional speaker row id
+    /// (resolved by the caller against this meeting's speakers) with the text.
+    pub fn insert_action_items(
+        &mut self,
+        meeting_id: &str,
+        summary_id: Option<i64>,
+        items: &[(Option<i64>, String)],
+    ) -> Result<usize, DbError> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut insert = tx.prepare(
+                "INSERT INTO action_items (meeting_id, summary_id, speaker_id, text) \
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for (speaker_id, text) in items {
+                insert.execute(params![meeting_id, summary_id, speaker_id, text])?;
+            }
+        }
+        tx.commit()?;
+        Ok(items.len())
+    }
+
+    /// Find a speaker id by display name among the speakers who actually have
+    /// segments in this meeting (never a global name lookup: meeting A's
+    /// "SPEAKER_00" must not resolve against meeting B's row — the same
+    /// namespacing rule as `resolve_speaker_id`).
+    pub fn speaker_in_meeting(
+        &self,
+        meeting_id: &str,
+        display_name: &str,
+    ) -> Result<Option<i64>, DbError> {
+        let result = self.conn.query_row(
+            "SELECT sp.id FROM speakers sp \
+             WHERE sp.display_name = ?2 AND EXISTS \
+                (SELECT 1 FROM segments s \
+                 WHERE s.meeting_id = ?1 AND s.speaker_id = sp.id) \
+             LIMIT 1",
+            params![meeting_id, display_name],
+            |r| r.get::<_, i64>(0),
+        );
+        match result {
+            Ok(id) => Ok(Some(id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    // ---- UI-facing reads (Tauri shell commands; serde-serializable rows) ----
+
+    /// Meetings, newest first.
+    pub fn list_meetings(&self, limit: u32) -> Result<Vec<MeetingRow>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, app, started_at, ended_at, status FROM meetings \
+             ORDER BY started_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |r| {
+            Ok(MeetingRow {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                app: r.get(2)?,
+                started_at: r.get(3)?,
+                ended_at: r.get(4)?,
+                status: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Latest version of a summary kind for a meeting, with its citations'
+    /// audio offsets joined in (the UI renders chips without a second query).
+    pub fn latest_summary(
+        &self,
+        meeting_id: &str,
+        kind: &str,
+    ) -> Result<Option<SummaryRow>, DbError> {
+        let result = self.conn.query_row(
+            "SELECT id, version, content, model, model_was_fallback FROM summaries \
+             WHERE meeting_id = ?1 AND kind = ?2 ORDER BY version DESC LIMIT 1",
+            params![meeting_id, kind],
+            |r| {
+                Ok(SummaryRow {
+                    id: r.get(0)?,
+                    version: r.get(1)?,
+                    kind: kind.to_string(),
+                    content: r.get(2)?,
+                    model: r.get(3)?,
+                    model_was_fallback: r.get::<_, i64>(4)? != 0,
+                    citations: Vec::new(),
+                })
+            },
+        );
+        let mut summary = match result {
+            Ok(s) => s,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT c.segment_id, c.quote, s.start_ms \
+             FROM summary_citations c JOIN segments s ON s.id = c.segment_id \
+             WHERE c.summary_id = ?1 ORDER BY s.start_ms ASC",
+        )?;
+        let rows = stmt.query_map(params![summary.id], |r| {
+            Ok(CitationRow {
+                segment_id: r.get(0)?,
+                quote: r.get(1)?,
+                start_ms: r.get::<_, i64>(2)? as u64,
+            })
+        })?;
+        summary.citations = rows.collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(summary))
+    }
+
+    pub fn action_items_for_meeting(
+        &self,
+        meeting_id: &str,
+    ) -> Result<Vec<ActionItemRow>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT a.id, a.text, a.done, sp.display_name FROM action_items a \
+             LEFT JOIN speakers sp ON sp.id = a.speaker_id \
+             WHERE a.meeting_id = ?1 ORDER BY a.id ASC",
+        )?;
+        let rows = stmt.query_map(params![meeting_id], |r| {
+            Ok(ActionItemRow {
+                id: r.get(0)?,
+                text: r.get(1)?,
+                done: r.get::<_, i64>(2)? != 0,
+                owner: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn set_action_item_done(&mut self, id: i64, done: bool) -> Result<(), DbError> {
+        self.conn.execute(
+            "UPDATE action_items SET done = ?2 WHERE id = ?1",
+            params![id, done as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Rename a speaker row (the who-said-what rail's click-to-rename; writes
+    /// speakers.display_name exactly as docs/01 §2.1 specifies).
+    pub fn rename_speaker(&mut self, speaker_id: i64, new_name: &str) -> Result<(), DbError> {
+        self.conn.execute(
+            "UPDATE speakers SET display_name = ?2 WHERE id = ?1",
+            params![speaker_id, new_name],
+        )?;
+        Ok(())
+    }
+
+    /// Per-speaker talk time for one meeting (the rail's talk-time bars).
+    pub fn speaker_stats(&self, meeting_id: &str) -> Result<Vec<SpeakerStat>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT sp.id, sp.display_name, sp.is_self, \
+                    SUM(s.end_ms - s.start_ms) AS talk_ms \
+             FROM segments s JOIN speakers sp ON sp.id = s.speaker_id \
+             WHERE s.meeting_id = ?1 \
+             GROUP BY sp.id ORDER BY talk_ms DESC",
+        )?;
+        let rows = stmt.query_map(params![meeting_id], |r| {
+            Ok(SpeakerStat {
+                speaker_id: r.get(0)?,
+                display_name: r.get(1)?,
+                is_self: r.get::<_, i64>(2)? != 0,
+                talk_ms: r.get::<_, i64>(3)? as u64,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub fn transcript(&self, meeting_id: &str) -> Result<Vec<Turn>, DbError> {
         let mut stmt = self.conn.prepare(
             "SELECT COALESCE(sp.display_name, 'Unknown'), s.text, s.start_ms, s.end_ms \
@@ -357,6 +628,80 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1, "one global self speaker across meetings");
         assert_eq!(is_self, 1);
+    }
+
+    #[test]
+    fn citations_and_action_items_round_trip() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.create_meeting("m1", "Standup", Some("zoom"), 1).unwrap();
+        store
+            .insert_transcript(
+                "m1",
+                &[
+                    (turn("Me", "I will send the budget", 0), "mic"),
+                    (turn("SPEAKER_00", "shipping moves to friday", 65_000), "system"),
+                ],
+            )
+            .unwrap();
+        let segments = store.segments_for_meeting("m1").unwrap();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[1].start_ms, 65_000);
+
+        let summary_id = store.insert_summary("m1", "notes", "notes [01:05]", "qwen", false).unwrap();
+        store
+            .insert_citations(summary_id, &[(segments[1].id, Some("shipping moves".into()))])
+            .unwrap();
+        let summary = store.latest_summary("m1", "notes").unwrap().unwrap();
+        assert_eq!(summary.id, summary_id);
+        assert_eq!(summary.citations.len(), 1);
+        assert_eq!(summary.citations[0].start_ms, 65_000);
+        assert!(store.latest_summary("m1", "outline").unwrap().is_none());
+
+        // Speaker resolution is meeting-scoped.
+        let me = store.speaker_in_meeting("m1", "Me").unwrap();
+        assert!(me.is_some());
+        assert!(store.speaker_in_meeting("m2", "Me").unwrap().is_none());
+
+        store
+            .insert_action_items("m1", Some(summary_id), &[(me, "send the budget".into())])
+            .unwrap();
+        let items = store.action_items_for_meeting("m1").unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].owner.as_deref(), Some("Me"));
+        assert!(!items[0].done);
+        store.set_action_item_done(items[0].id, true).unwrap();
+        assert!(store.action_items_for_meeting("m1").unwrap()[0].done);
+    }
+
+    #[test]
+    fn ui_reads_meetings_stats_and_rename() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.create_meeting("m1", "A", Some("zoom"), 100).unwrap();
+        store.create_meeting("m2", "B", None, 200).unwrap();
+        let meetings = store.list_meetings(10).unwrap();
+        assert_eq!(meetings.len(), 2);
+        assert_eq!(meetings[0].id, "m2", "newest first");
+
+        store
+            .insert_transcript(
+                "m1",
+                &[
+                    (turn("Me", "short", 0), "mic"),
+                    (turn("SPEAKER_00", "a much longer remark", 2_000), "system"),
+                    (turn("SPEAKER_00", "and another one", 4_000), "system"),
+                ],
+            )
+            .unwrap();
+        let stats = store.speaker_stats("m1").unwrap();
+        assert_eq!(stats.len(), 2);
+        assert_eq!(stats[0].display_name, "SPEAKER_00", "most talk time first");
+        assert_eq!(stats[0].talk_ms, 2_000);
+        assert!(stats.iter().any(|s| s.is_self));
+
+        let anon = stats[0].speaker_id;
+        store.rename_speaker(anon, "Sarah").unwrap();
+        let segs = store.segments_for_meeting("m1").unwrap();
+        assert!(segs.iter().any(|s| s.speaker == "Sarah"));
     }
 
     #[test]

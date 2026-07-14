@@ -101,13 +101,33 @@ def cmd_audio(args: argparse.Namespace) -> int:
         audio_mic_path=os.path.abspath(args.mic) if args.mic else None,
     )
 
+    counts = _extract_structured(conn, meeting_id, result["outline"])
+
     md_path = os.path.splitext(args.audio)[0] + ".notes.md"
     with open(md_path, "w") as f:
         f.write(f"# {title}\n\n{result['notes']}\n")
 
-    print(f"[4/4] Done. Meeting {meeting_id} stored in {args.out_db}; notes at {md_path}")
+    print(
+        f"[4/4] Done. Meeting {meeting_id} stored in {args.out_db} "
+        f"({counts['citations']} citations, {counts['action_items']} action items); "
+        f"notes at {md_path}"
+    )
     notify(f"Summary ready: {title}")
     return 0
+
+
+def _extract_structured(conn, meeting_id: str, outline: str) -> dict:
+    """Stage 4 + structured storage. An LLM failure here must not fail the
+    run — the summary is already stored — so it degrades to citations-only
+    (which need no server) with a warning."""
+    from wsw.summarize import SummarizeError, extract_action_items
+
+    response = None
+    try:
+        response = extract_action_items(outline)
+    except SummarizeError as e:
+        print(f"      action-item extraction failed: {e} (summary kept)")
+    return store.save_structured_extraction(conn, meeting_id, response)
 
 
 def cmd_meetily(args: argparse.Namespace) -> int:
@@ -140,7 +160,13 @@ def cmd_meetily(args: argparse.Namespace) -> int:
         model=result["model"],
         app="meetily-import",
     )
-    print(f"[3/3] Done. Stored as meeting {meeting_id} in {args.out_db}")
+    # Meetily imports carry ordering-only timestamps (see meetily_source), so
+    # citation offsets point at the right segment but not a real audio moment.
+    counts = _extract_structured(conn, meeting_id, result["outline"])
+    print(
+        f"[3/3] Done. Stored as meeting {meeting_id} in {args.out_db} "
+        f"({counts['citations']} citations, {counts['action_items']} action items)"
+    )
     notify(f"Summary ready: {meeting['title']}")
     return 0
 

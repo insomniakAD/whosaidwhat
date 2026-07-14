@@ -17,6 +17,8 @@
 //! speech through a 48k→16k linear resampler measures within noise for ASR
 //! purposes and avoids a DSP dependency; swap in `rubato` if artifacts show.
 
+pub mod worker;
+
 use std::path::Path;
 
 use crate::asr::Transcriber;
@@ -24,7 +26,11 @@ use crate::db::{DbError, Store};
 use crate::diarize::merge::{attribute_speakers, coalesce_turns, interleave};
 use crate::diarize::Diarizer;
 use crate::llm::chunk::Turn;
-use crate::llm::router::InferenceRouter;
+use crate::llm::extract::{
+    parse_action_items, parse_timestamps, quote_snippet, resolve_segment, SegmentSpan,
+    ACTION_ITEMS_PROMPT,
+};
+use crate::llm::router::{InferenceRouter, SamplingProfile};
 use crate::llm::summarize::{summarize, SummarizeConfig};
 
 #[derive(Debug, thiserror::Error)]
@@ -163,10 +169,119 @@ pub async fn process_recording(
         &output.model.model,
         !output.model.preferred,
     )?;
-    store.insert_summary(meeting_id, "outline", &output.outline, &output.model.model, !output.model.preferred)?;
+    let outline_id = store.insert_summary(
+        meeting_id,
+        "outline",
+        &output.outline,
+        &output.model.model,
+        !output.model.preferred,
+    )?;
+
+    // 5. Structured citations: every [mm:ss] marker the summarizer preserved,
+    // resolved to a real segment (unresolvable markers are dropped — see
+    // llm::extract). Quotes carry the cited words for hover previews.
+    progress("cite", 0, 1);
+    let segments = store.segments_for_meeting(meeting_id)?;
+    let spans: Vec<SegmentSpan> = segments
+        .iter()
+        .map(|s| SegmentSpan { id: s.id, start_ms: s.start_ms, end_ms: s.end_ms })
+        .collect();
+    for (sid, content) in [(summary_id, output.notes.as_str()), (outline_id, output.outline.as_str())] {
+        let citations: Vec<(i64, Option<String>)> = parse_timestamps(content)
+            .into_iter()
+            .filter_map(|ms| resolve_segment(ms, &spans))
+            .map(|segment_id| {
+                let quote = segments
+                    .iter()
+                    .find(|s| s.id == segment_id)
+                    .map(|s| quote_snippet(&s.text));
+                (segment_id, quote)
+            })
+            .collect();
+        store.insert_citations(sid, &citations)?;
+    }
+    progress("cite", 1, 1);
+
+    // 6. Action items: stage-4 extraction over the outline (the surface that
+    // keeps timestamps). A failure here must not fail the meeting — the
+    // summary is already stored — so it degrades to zero items with a log.
+    progress("actions", 0, 1);
+    match router
+        .summarize_stage(&output.model, ACTION_ITEMS_PROMPT, &output.outline, SamplingProfile::Strict)
+        .await
+    {
+        Ok(response) => {
+            let mut rows: Vec<(Option<i64>, String)> = Vec::new();
+            for item in parse_action_items(&response) {
+                let speaker_id = match &item.owner {
+                    Some(name) => store.speaker_in_meeting(meeting_id, name)?,
+                    None => None,
+                };
+                rows.push((speaker_id, item.text));
+            }
+            store.insert_action_items(meeting_id, Some(summary_id), &rows)?;
+        }
+        Err(e) => {
+            tracing::warn!("action-item extraction failed for {meeting_id}: {e} (summary kept)");
+        }
+    }
+    progress("actions", 1, 1);
+
     store.set_meeting_status(meeting_id, "summarized")?;
 
     Ok(summary_id)
+}
+
+/// Load the user-configured engines and run [`process_recording`] — the one
+/// entry point shared by the headless daemon (main.rs) and the Tauri shell
+/// (shell.rs), so engine selection never drifts between the two.
+///
+/// ASR + diarization models load lazily per call; on 64 GB the ~2 GB whisper
+/// + ~50 MB diarization models could stay resident, but cold-loading keeps
+/// the idle footprint near zero and adds only seconds per meeting.
+pub async fn run_with_default_engines(
+    store: &mut Store,
+    router: &InferenceRouter,
+    meeting_id: &str,
+    system_wav: &Path,
+    mic_wav: Option<&Path>,
+    progress: &mut (dyn FnMut(&str, usize, usize) + Send),
+) -> anyhow::Result<i64> {
+    let config_path = crate::config::Config::default().data_dir.join("config.json");
+    let config = crate::config::Config::load_or_default(&config_path);
+
+    #[cfg(feature = "asr-whisper")]
+    let mut transcriber = crate::asr::whisper::WhisperTranscriber::new(
+        &config.whisper_model.display().to_string(),
+        &config.language,
+    )?;
+    #[cfg(not(feature = "asr-whisper"))]
+    anyhow::bail!("built without an ASR engine (enable feature asr-whisper)");
+
+    #[cfg(feature = "diarize-sherpa")]
+    let mut diarizer = crate::diarize::sherpa::SherpaDiarizer::new(
+        &config.diarize_segmentation_model.display().to_string(),
+        &config.diarize_embedding_model.display().to_string(),
+        config.expected_speakers,
+    )?;
+    #[cfg(not(feature = "diarize-sherpa"))]
+    anyhow::bail!("built without a diarization engine (enable feature diarize-sherpa)");
+
+    #[cfg(all(feature = "asr-whisper", feature = "diarize-sherpa"))]
+    {
+        let summary_id = process_recording(
+            store,
+            router,
+            &mut transcriber,
+            &mut diarizer,
+            meeting_id,
+            mic_wav.filter(|p| p.exists()),
+            system_wav,
+            progress,
+        )
+        .await?;
+        Ok(summary_id)
+    }
 }
 
 #[cfg(test)]
@@ -190,4 +305,5 @@ mod tests {
         assert_eq!(resample_linear(&x, 16_000, 16_000), x);
         assert!(resample_linear(&[], 48_000, 16_000).is_empty());
     }
+
 }

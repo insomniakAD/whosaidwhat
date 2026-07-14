@@ -15,11 +15,11 @@ Zoom / Teams / Meet meeting detected → "Start recording?" → two-track captur
 (Metal) + sherpa-onnx diarization → speaker-attributed transcript in SQLite (FTS5)
 → 3-stage MapReduce summary via oMLX (Qwen3.6-35B-A3B) → versioned notes.
 
-Every transcript segment carries a millisecond offset, and the summarizer is
-prompted to preserve `[mm:ss]` markers, so notes can point back into the audio.
-The dedicated `summary_citations` / `action_items` tables that turn those markers
-into structured deep-links are schema-defined and ready, but not yet populated —
-see [status](#honest-status).
+Every transcript segment carries a millisecond offset, the summarizer preserves
+`[mm:ss]` markers, and an extraction stage resolves those markers into
+`summary_citations` rows plus a stage-4 pass that fills `action_items` — so the
+dashboard's citation chips click through to the exact transcript moment. See
+[status](#honest-status) for what remains.
 
 Full diagram: [`docs/00-architecture.md`](docs/00-architecture.md)
 
@@ -27,8 +27,9 @@ Full diagram: [`docs/00-architecture.md`](docs/00-architecture.md)
 
 | Path | What |
 |---|---|
-| `src-tauri/` | Rust backend: `detect/` (process watchers, state machine), `capture/` (two-track recording, auto-stop), `asr/` (whisper-rs), `diarize/` (sherpa-onnx + merge), `llm/` (oMLX client, router, summarizer), `db.rs`, `notify.rs`, `pipeline.rs` |
-| `pipeline/` | Runnable Python pipeline: local diarization (pyannote community-1), Apple-Silicon ASR (mlx-whisper), oMLX summarization; `run.py audio ...` or `run.py meetily` |
+| `src-tauri/` | Rust backend: `detect/` (process watchers, state machine), `capture/` (two-track recording, auto-stop), `asr/` (whisper-rs), `diarize/` (sherpa-onnx + merge), `llm/` (oMLX client, router, summarizer, `extract.rs` citations/actions), `db.rs`, `notify.rs` (window prompt + `un_center`), `pipeline/` (stages + background worker), `shell.rs` (Tauri v2 app), `tauri.conf.json`, `capabilities/` |
+| `dist/` | The webview frontend — hand-written static HTML/CSS/JS, no bundler ("Paper & Verdigris", docs/01): dashboard, consent prompt, recording pill |
+| `pipeline/` | Runnable Python pipeline: local diarization (pyannote community-1), Apple-Silicon ASR (mlx-whisper), oMLX summarization + extraction; `run.py audio ...` or `run.py meetily` |
 | `schema.sql` | The SQLite schema (single source of truth for Rust + Python) |
 | `docs/` | Task deliverables 00–05 + build log |
 | `reference/meetily_pipeline/` | The original attached scripts, unmodified, for diffing |
@@ -59,28 +60,44 @@ python3 run.py meetily
 **Tests** (no network, no heavy deps — run anywhere):
 
 ```bash
-cd pipeline && python3 -m unittest discover tests        # 18 tests
+cd pipeline && python3 -m unittest discover tests        # 34 tests
 cd src-tauri && cargo test                               # on a normal network
+# no network at all? the bare-rustc harness runs the pure core's 49 tests:
+rustc --edition 2021 --test src-tauri/harness/harness.rs -o /tmp/wsw && /tmp/wsw
 ```
 
 **Rust daemon** (macOS): `cd src-tauri && cargo run` — watches for meetings,
 records per policy (`config.json`: prompt/auto/manual), pipelines on meeting end.
 
+**Tauri shell** (macOS): `cd src-tauri && cargo build --features shell --bin
+whosaidwhat-app` (build.rs runs Tauri codegen only under this feature, so
+`cargo test` stays webview-free), or `tauri dev` / `tauri build` with the
+`shell` feature enabled. Bundled builds prompt via UNUserNotificationCenter
+action buttons; unbundled builds use the always-on-top prompt window.
+
 ## Honest status
 
 Authored in a sandbox with a default-deny egress proxy (no crates.io/PyPI, most
-sites unfetchable): the pure-logic core is compiled and tested here (30 Rust +
-21 Python tests, schema exercised end-to-end; 4 more rusqlite-backed Rust tests
-run under `cargo test`); macOS FFI and third-party-crate
-surfaces are written from cited evidence and flagged in-file where the first
-`cargo build` on a Mac is the type-check. Details: BUILD_LOG D-006/D-008.
+sites unfetchable): the pure-logic core is compiled and tested here (49 Rust
+tests via the bare-rustc harness, now committed at
+`src-tauri/harness/harness.rs`, + 34 Python tests, schema exercised
+end-to-end; more rusqlite-backed Rust tests run under `cargo test`); macOS FFI,
+Tauri, and third-party-crate surfaces are written from cited evidence and
+flagged in-file where the first `cargo build` on a Mac is the type-check.
+Details: BUILD_LOG D-006/D-008 and the run-2 appendix.
 
-**What is not yet built** (schema/traits ready, code pending — tracked honestly
-rather than claimed done): structured `summary_citations` + `action_items`
-extraction (the summarizer preserves `[mm:ss]` markers inline today); the Tauri
-frontend shell (the notification prompt, recording pill, and dashboard from
-docs/01 are designed and the backend traits exist, but no `tauri.conf.json` /
-webview is in this repo yet); the `un_center` bundled-build notification path;
-and moving the post-recording pipeline off the detection thread. The headless
-daemon runs the full detect → capture → transcribe → diarize → summarize → store
-loop under `RecordPolicy::Auto`.
+**Built in run 2** (previously listed here as pending): structured
+`summary_citations` + `action_items` extraction in both Rust and Python; the
+post-recording pipeline moved to a background worker thread; the Tauri v2 shell
+(`tauri.conf.json`, capabilities, `shell.rs`, static `dist/` frontend —
+dashboard with citation chips, who-said-what rail, consent prompt window,
+recording pill) making `RecordPolicy::Prompt` functional; and the
+`un_center` UNUserNotificationCenter path with real action buttons.
+
+**Still not built** (tracked honestly rather than claimed done): audio-player
+seek from citation chips (chips jump the transcript; the webview has no
+`asset:` protocol grant yet); `.icns` bundle icons (`icons/icon.png` is a
+generated placeholder — run `tauri icon` on a Mac); cross-meeting speaker
+re-identification via stored embeddings (schema-ready); and none of the Tauri
+/ objc2-user-notifications surfaces have been type-checked against their real
+crates from this sandbox.

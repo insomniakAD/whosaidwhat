@@ -24,3 +24,8 @@ pub mod diarize;
 pub mod llm;
 pub mod notify;
 pub mod pipeline;
+
+/// Tauri v2 desktop shell (dashboard, consent prompt, recording pill).
+/// Feature-gated so the default build stays webview-free (see Cargo.toml).
+#[cfg(feature = "shell")]
+pub mod shell;

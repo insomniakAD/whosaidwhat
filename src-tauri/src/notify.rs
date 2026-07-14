@@ -105,30 +105,230 @@ impl PromptPresenter for WindowPrompt {
 
 /// UNUserNotificationCenter presenter for bundled builds.
 ///
-/// Implementation lives behind cfg(macos) and is deliberately thin: category
-/// registration (`WSW_MEETING` with `START_RECORDING` / `DISMISS` actions),
-/// a delegate implementing `userNotificationCenter:didReceiveNotificationResponse:`,
-/// and permission request on first use. See the objc2 pattern used by shipped
-/// Tauri apps referenced in docs/02-process-detection.md §Notifications.
+/// Kept separate from [`WindowPrompt`] so the dev loop never touches
+/// UNUserNotificationCenter — calling it from an unbundled binary raises
+/// `NSInternalInconsistencyException: bundleProxyForCurrentProcess is nil`
+/// and aborts the process (Apple forums threads 679326 / 649583; the exact
+/// message is quoted in invertase/notifee#260). Callers MUST check
+/// [`un_center::available`] first.
 #[cfg(target_os = "macos")]
 pub mod un_center {
-    //! Skeleton for the bundled-build path. Kept separate from WindowPrompt so
-    //! the dev loop never touches UNUserNotificationCenter (which aborts the
-    //! process when called from an unbundled binary).
+    //! Actionable "Meeting detected — start recording?" notification via
+    //! `objc2-user-notifications` (the `notify-rust`/`mac-notification-sys`
+    //! stack tauri-plugin-notification uses wraps the deprecated
+    //! NSUserNotification API and cannot deliver action buttons on macOS —
+    //! notify-rust#145; the plugin's Actions API is mobile-only per
+    //! v2.tauri.app/plugin/notification).
     //!
-    //! To finish when the app gets its bundle + signing:
-    //! 1. `UNUserNotificationCenter::currentNotificationCenter()`
-    //! 2. `requestAuthorizationWithOptions:completionHandler:` (alert + sound)
-    //! 3. Register `UNNotificationCategory` "WSW_MEETING" with actions
-    //!    `START_RECORDING` (foreground) and `DISMISS` (destructive).
-    //! 4. Set a `define_class!` delegate; forward the chosen action to the
-    //!    same `PromptResponse` channel WindowPrompt uses.
+    //! API surface written verbatim against the generated bindings in
+    //! github.com/madsmtm/objc2-generated (UserNotifications/*.rs) and the
+    //! shipped usage in wezterm's `wezterm-toast-notification/src/macos.rs`
+    //! (define_class! delegate, RcBlock completion handlers, category +
+    //! action registration) — evidence tiers in docs/02 §Notifications.
+    //! NOT COMPILED IN THIS SANDBOX (crates.io blocked, macOS target): the
+    //! first `cargo build` on a Mac is the type-check, per BUILD_LOG D-006.
+    //!
+    //! Integration contract (delegate-before-launch): construct
+    //! [`UnCenterPrompt`] during app startup — for the Tauri shell, inside
+    //! `.setup()` — so responses that arrive while the app was closed are
+    //! not missed (Apple: assign the delegate before the app finishes
+    //! launching).
 
-    /// Bundle-time gate: `UNUserNotificationCenter` requires a real .app bundle.
+    use std::sync::{Arc, Mutex};
+
+    use block2::{Block, RcBlock};
+    use objc2::rc::Retained;
+    use objc2::runtime::{Bool, ProtocolObject};
+    use objc2::{define_class, msg_send, AllocAnyThread, DefinedClass};
+    use objc2_foundation::{
+        ns_string, NSArray, NSBundle, NSError, NSObject, NSObjectProtocol, NSSet, NSString,
+    };
+    use objc2_user_notifications::{
+        UNAuthorizationOptions, UNMutableNotificationContent, UNNotificationAction,
+        UNNotificationActionOptions, UNNotificationCategory, UNNotificationCategoryOptions,
+        UNNotificationRequest, UNNotificationResponse, UNUserNotificationCenter,
+        UNUserNotificationCenterDelegate,
+    };
+
+    use super::{prompt_copy, PromptPresenter, PromptResponse};
+    use crate::detect::state::MeetingApp;
+
+    // Note: identifiers appear as literals inside `ns_string!` below (the
+    // macro takes a string literal, not a const); these consts exist for the
+    // Rust-side comparisons and must stay in sync with those literals.
+    const ACTION_START: &str = "WSW_START";
+    const REQUEST_ID: &str = "wsw-meeting-prompt";
+
+    /// Bundle gate: UNUserNotificationCenter requires a real .app bundle with
+    /// a bundle identifier; anything else (plain `cargo run`, `tauri dev`
+    /// without a bundle) must stay on [`super::WindowPrompt`]. This is the
+    /// defensive check pattern used by shipped objc2 consumers
+    /// (takemo101/agent-bench src/notification/center.rs).
     pub fn available() -> bool {
-        // A bundled app has a non-root bundle path ending in .app; `tauri dev`
-        // binaries do not. Checked via NSBundle in the full implementation.
-        std::env::var("WSW_FORCE_UN_NOTIFICATIONS").is_ok()
+        unsafe { NSBundle::mainBundle().bundleIdentifier().is_some() }
+    }
+
+    type PendingResponse = Arc<Mutex<Option<Box<dyn FnOnce(PromptResponse) + Send>>>>;
+
+    pub struct DelegateIvars {
+        pending: PendingResponse,
+    }
+
+    define_class!(
+        // SAFETY: NSObject subclass with no lifecycle overrides; ivars are a
+        // plain Rust struct managed by objc2's DefinedClass machinery.
+        #[unsafe(super = NSObject)]
+        #[name = "WSWNotificationDelegate"]
+        #[ivars = DelegateIvars]
+        pub struct NotifDelegate;
+
+        unsafe impl NSObjectProtocol for NotifDelegate {}
+
+        unsafe impl UNUserNotificationCenterDelegate for NotifDelegate {
+            /// The user tapped the notification or one of its action buttons.
+            /// `actionIdentifier` is our action id, or Apple's default
+            /// ("com.apple.UNNotificationDefaultActionIdentifier", a body
+            /// click) / dismiss ("com.apple.UNNotificationDismissActionIdentifier",
+            /// delivered because the category opts into CustomDismissAction).
+            #[unsafe(method(userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:))]
+            unsafe fn did_receive(
+                &self,
+                _center: &UNUserNotificationCenter,
+                response: &UNNotificationResponse,
+                completion_handler: &Block<dyn Fn()>,
+            ) {
+                let action = unsafe { response.actionIdentifier() }.to_string();
+                // Only the explicit button records; a body click or dismissal
+                // is not consent (docs/02 §3: one honest question).
+                let chosen = if action == ACTION_START {
+                    PromptResponse::StartRecording
+                } else {
+                    PromptResponse::Dismiss
+                };
+                if let Ok(mut pending) = self.ivars().pending.lock() {
+                    if let Some(cb) = pending.take() {
+                        cb(chosen);
+                    }
+                }
+                completion_handler.call(());
+            }
+        }
+    );
+
+    impl NotifDelegate {
+        fn new(pending: PendingResponse) -> Retained<Self> {
+            let this = Self::alloc().set_ivars(DelegateIvars { pending });
+            unsafe { msg_send![super(this), init] }
+        }
+    }
+
+    /// [`PromptPresenter`] over UNUserNotificationCenter. Construct once at
+    /// startup (see module docs); [`available`] must be true.
+    pub struct UnCenterPrompt {
+        center: Retained<UNUserNotificationCenter>,
+        // The center holds its delegate WEAKLY — this field is what keeps it
+        // alive (wezterm re-reads CENTER.delegate() after setting it to prove
+        // exactly this point).
+        _delegate: Retained<NotifDelegate>,
+        pending: PendingResponse,
+    }
+
+    // SAFETY: Apple documents UNUserNotificationCenter as usable from any
+    // thread, and wezterm shares its center through a `LazyLock` static (both
+    // cited in docs/02 §Notifications). The delegate is only ever invoked by
+    // the ObjC runtime; `pending` is the one piece of shared Rust state and
+    // it is behind a Mutex.
+    unsafe impl Send for UnCenterPrompt {}
+
+    impl UnCenterPrompt {
+        pub fn new() -> Self {
+            assert!(available(), "UNUserNotificationCenter requires a bundled .app");
+            let pending: PendingResponse = Arc::new(Mutex::new(None));
+            let delegate = NotifDelegate::new(pending.clone());
+            let center = unsafe { UNUserNotificationCenter::currentNotificationCenter() };
+
+            unsafe {
+                let proto = ProtocolObject::from_retained(delegate.clone());
+                center.setDelegate(Some(&proto));
+
+                // Nothing shows until the user grants this (first call shows
+                // the system permission dialog; later calls are no-ops).
+                let on_auth = RcBlock::new(|granted: Bool, _err: *mut NSError| {
+                    if !granted.as_bool() {
+                        tracing::warn!("notification permission denied; prompts will not appear");
+                    }
+                });
+                center.requestAuthorizationWithOptions_completionHandler(
+                    UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound,
+                    &on_auth,
+                );
+
+                // Category with the two actions. Start is a background action
+                // (recording starts in-process; yanking the meeting out of
+                // focus to foreground our app would be hostile). Dismiss is
+                // Destructive so it renders in the warning style, and the
+                // category opts into CustomDismissAction so swipe-dismiss
+                // reaches the delegate and clears the pending callback.
+                let start = UNNotificationAction::actionWithIdentifier_title_options(
+                    ns_string!("WSW_START"),
+                    ns_string!("Start recording"),
+                    UNNotificationActionOptions::empty(),
+                );
+                let dismiss = UNNotificationAction::actionWithIdentifier_title_options(
+                    ns_string!("WSW_DISMISS"),
+                    ns_string!("Ignore"),
+                    UNNotificationActionOptions::Destructive,
+                );
+                let no_intents: Retained<NSArray<NSString>> = NSArray::new();
+                let category = UNNotificationCategory::categoryWithIdentifier_actions_intentIdentifiers_options(
+                    ns_string!("WSW_MEETING"),
+                    &NSArray::from_retained_slice(&[start, dismiss]),
+                    &no_intents,
+                    UNNotificationCategoryOptions::CustomDismissAction,
+                );
+                center.setNotificationCategories(&NSSet::from_retained_slice(&[category]));
+            }
+
+            UnCenterPrompt { center, _delegate: delegate, pending }
+        }
+
+        fn withdraw(&self) {
+            unsafe {
+                let ids = NSArray::from_retained_slice(&[NSString::from_str(REQUEST_ID)]);
+                self.center.removePendingNotificationRequestsWithIdentifiers(&ids);
+                self.center.removeDeliveredNotificationsWithIdentifiers(&ids);
+            }
+        }
+    }
+
+    impl PromptPresenter for UnCenterPrompt {
+        fn show(&mut self, app: &MeetingApp, on_response: Box<dyn FnOnce(PromptResponse) + Send>) {
+            let (title, body) = prompt_copy(app);
+            if let Ok(mut pending) = self.pending.lock() {
+                *pending = Some(on_response);
+            }
+            unsafe {
+                let content = UNMutableNotificationContent::new();
+                content.setTitle(&NSString::from_str(&title));
+                content.setBody(&NSString::from_str(&body));
+                content.setCategoryIdentifier(ns_string!("WSW_MEETING"));
+                // trigger: None ⇒ deliver immediately (generated signature:
+                // requestWithIdentifier:content:trigger: with Option trigger).
+                let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
+                    ns_string!("wsw-meeting-prompt"),
+                    &content,
+                    None,
+                );
+                self.center.addNotificationRequest_withCompletionHandler(&request, None);
+            }
+        }
+
+        fn dismiss(&mut self) {
+            if let Ok(mut pending) = self.pending.lock() {
+                *pending = None;
+            }
+            self.withdraw();
+        }
     }
 }
 
