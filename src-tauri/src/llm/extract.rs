@@ -179,10 +179,17 @@ pub fn parse_action_items(response: &str) -> Vec<ActionItem> {
         // Trailing timestamp: strip it from the display text, keep it as data.
         let ts_list = parse_timestamps(&text);
         let ts_ms = ts_list.last().copied();
-        if let Some(open) = text.rfind('[') {
-            if text[open..].ends_with(']') && parse_marker(text[open..].as_bytes()).is_some() {
-                text.truncate(open);
-                text.truncate(text.trim_end().len());
+        // Strip ONLY a marker that ends at the end of the (trimmed) text —
+        // never a mid-text marker that merely happens to sit before a stray
+        // `]`. Mirrors wsw.extract's `trailing.end() == len(text)` check so
+        // both twins store identical text for identical input.
+        let trimmed_len = text.trim_end().len();
+        if let Some(open) = text[..trimmed_len].rfind('[') {
+            if let Some((_, consumed)) = parse_marker(text[open..].as_bytes()) {
+                if open + consumed == trimmed_len {
+                    text.truncate(open);
+                    text.truncate(text.trim_end().len());
+                }
             }
         }
         if text.is_empty() {
@@ -294,6 +301,24 @@ Some stray narration the model added.
     fn none_response_yields_no_items() {
         assert!(parse_action_items("None").is_empty());
         assert!(parse_action_items("").is_empty());
+    }
+
+    #[test]
+    fn only_a_truly_trailing_marker_is_stripped() {
+        // Mid-text marker followed by more text + a stray `]`: the marker is
+        // NOT trailing, so the text is kept verbatim (twin parity with
+        // wsw.extract — the earlier rfind('[')+ends_with(']') logic wrongly
+        // truncated to "do the thing").
+        let items = parse_action_items("* Owner: do the thing [12:41] more]");
+        assert_eq!(items[0].text, "do the thing [12:41] more]");
+        assert_eq!(items[0].ts_ms, Some((12 * 60 + 41) * 1000));
+        // A genuinely trailing marker still strips.
+        let t = parse_action_items("* Owner: ship it [02:00]");
+        assert_eq!(t[0].text, "ship it");
+        // Two markers, last one trailing: strip only the trailing one.
+        let two = parse_action_items("* Owner: foo [01:00] bar [02:00]");
+        assert_eq!(two[0].text, "foo [01:00] bar");
+        assert_eq!(two[0].ts_ms, Some(120_000));
     }
 
     #[test]

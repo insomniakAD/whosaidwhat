@@ -88,6 +88,18 @@ class TestParseActionItems(unittest.TestCase):
         self.assertEqual(extract.parse_action_items("None"), [])
         self.assertEqual(extract.parse_action_items(""), [])
 
+    def test_only_a_truly_trailing_marker_is_stripped(self):
+        # Twin parity with llm::extract.rs: a mid-text marker before a stray
+        # ']' is NOT trailing, so the text is kept verbatim.
+        items = extract.parse_action_items("* Owner: do the thing [12:41] more]")
+        self.assertEqual(items[0]["text"], "do the thing [12:41] more]")
+        self.assertEqual(items[0]["ts_ms"], (12 * 60 + 41) * 1000)
+        t = extract.parse_action_items("* Owner: ship it [02:00]")
+        self.assertEqual(t[0]["text"], "ship it")
+        two = extract.parse_action_items("* Owner: foo [01:00] bar [02:00]")
+        self.assertEqual(two[0]["text"], "foo [01:00] bar")
+        self.assertEqual(two[0]["ts_ms"], 120_000)
+
     def test_bracketed_owner(self):
         items = extract.parse_action_items("* [Kim]: draft the rollout plan [03:00]")
         self.assertEqual(items[0]["owner"], "Kim")
