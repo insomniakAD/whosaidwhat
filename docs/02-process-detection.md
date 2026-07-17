@@ -112,9 +112,19 @@ delivered through the plugin on macOS. **[fetched]**
 https://github.com/tauri-apps/plugins-workspace/blob/v2/plugins/notification/src/desktop.rs
 (the desktop path even fakes the bundle id in dev: `set_application("com.apple.Terminal")`).
 
-Shipped work-arounds. **What is implemented today:** only path 1 —
-`notify::WindowPrompt` implements `notify::PromptPresenter`. Path 2 is a
-comment-only skeleton (`notify::un_center`) for the bundled build.
+Shipped work-arounds. **Both paths are implemented** behind
+`notify::PromptPresenter`: path 1 as `notify::WindowPrompt` (wired to the
+shell's `prompt` window), path 2 as `notify::un_center::UnCenterPrompt` —
+category `WSW_MEETING` with `WSW_START`/`WSW_DISMISS` actions, a
+`define_class!` delegate, `CustomDismissAction` so swipe-dismiss clears the
+pending callback, gated on `un_center::available()` (NSBundle
+bundle-identifier check; UN APIs raise `NSInternalInconsistencyException`
+in unbundled binaries — Apple forums 679326/649583). The shell picks
+un_center when bundled, the window otherwise (shell.rs `PromptSurface`).
+API surface written against the generated bindings
+(github.com/madsmtm/objc2-generated, UserNotifications/*.rs) and wezterm's
+shipped delegate (wezterm-toast-notification/src/macos.rs); not compilable
+in this sandbox — flagged in-file per D-006.
 1. **Custom always-on-top window** styled as a notification — works under `tauri
    dev`, no permissions, fully clickable. **[fetched]**
    https://github.com/pixelsmasher13/platypus/blob/main/src-tauri/src/engine/meeting_popup.rs

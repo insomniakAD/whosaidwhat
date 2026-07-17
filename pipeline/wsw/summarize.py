@@ -57,6 +57,7 @@ You are an expert writer translating an outline into polished meeting notes.
 Write in a direct, calm, and human tone.
 Avoid all corporate filler and AI-speak. Do not use em dashes anywhere.
 Structure the notes using clear H2 and H3 headings, ending with an "Action Items" section listing owner and task.
+Keep the [mm:ss] timestamp markers from the outline attached to the points they belong to; do not invent new ones.
 Do not include generic opening remarks or signatures."""
 
 # Official Qwen3.6-35B-A3B card recommendations.
@@ -137,3 +138,12 @@ def summarize(
     progress("rewrite", 1, 1)
 
     return {"outline": outline, "notes": notes, "model": MODEL_NAME}
+
+
+def extract_action_items(outline: str) -> str:
+    """Stage 4: the strict action-item extraction call over the outline (the
+    stage that keeps [mm:ss] markers). Returns the raw response; parsing lives
+    in wsw.extract.parse_action_items so it is testable without a server."""
+    from .extract import ACTION_ITEMS_PROMPT
+
+    return _run_stage(_client(), ACTION_ITEMS_PROMPT, outline, STRICT)

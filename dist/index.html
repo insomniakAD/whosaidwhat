@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>whosaidwhat</title>
+  <link rel="stylesheet" href="css/app.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="toolbar">
+      <div class="brand">whosaid<em>what</em></div>
+      <input class="search" id="search" type="search"
+             placeholder="Search everything anyone said&hellip;" autocomplete="off" />
+      <button class="record-btn" id="record-btn">
+        <span class="dot"></span><span id="record-label">Record</span>
+      </button>
+    </header>
+
+    <nav class="sidebar" id="sidebar">
+      <div class="empty" id="sidebar-empty">No meetings yet.<br />Join one and say yes.</div>
+    </nav>
+
+    <main class="detail" id="detail">
+      <section class="content" id="content">
+        <div class="empty">Select a meeting — or just start talking.</div>
+      </section>
+      <aside class="rail" id="rail">
+        <h4>Who said what</h4>
+        <div id="rail-list"></div>
+        <div class="hint">Click a name to filter the transcript. Double-click to rename.</div>
+      </aside>
+    </main>
+  </div>
+
+  <script src="js/bridge.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>

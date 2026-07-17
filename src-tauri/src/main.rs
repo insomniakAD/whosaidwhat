@@ -5,7 +5,12 @@
 //!   detector poll ──events──► session manager ──effects──► prompt / recorder
 //!        ▲                                                        │
 //!        └──── self_recording flag (per-process mic checks) ◄─────┘
-//!   RecordingSaved ─► pipeline::process_recording ─► SQLite + notification
+//!   RecordingSaved ─► pipeline::worker (background thread, own DB connection)
+//!                        └─► pipeline::process_recording ─► SQLite + notification
+//!
+//! The pipeline runs on a dedicated worker thread (pipeline::worker), so the
+//! detection loop keeps polling while a recording is transcribed — a meeting
+//! that starts mid-processing is detected and recorded on time.
 
 fn main() {
     #[cfg(not(target_os = "macos"))]
@@ -34,6 +39,7 @@ mod macos_main {
     use whosaidwhat::detect::state::{DetectorEvent, MeetingApp};
     use whosaidwhat::detect::{macos::MacSignalSource, Detector};
     use whosaidwhat::llm::router::InferenceRouter;
+    use whosaidwhat::pipeline::worker::{Job, PipelineWorker};
 
     pub fn run() {
         let config_path = Config::default().data_dir.join("config.json");
@@ -41,7 +47,48 @@ mod macos_main {
         let _ = config.save(&config_path); // materialize defaults on first run
 
         let mut store = Store::open(&config.db_path()).expect("open database");
-        let router = InferenceRouter::new(config.inference.clone());
+
+        // Pipeline worker: its OWN Store connection, router, and runtime, all
+        // constructed on the worker thread. The detection loop only creates
+        // the meeting row (milliseconds) and queues a Job; WAL + busy_timeout
+        // (db.rs) make the two writers safe.
+        let worker_db_path = config.db_path();
+        let worker_inference = config.inference.clone();
+        let worker = PipelineWorker::spawn(
+            move || {
+                let store = Store::open(&worker_db_path).expect("open database (worker)");
+                let router = InferenceRouter::new(worker_inference);
+                let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+                (store, router, runtime)
+            },
+            |(store, router, runtime), job: Job| {
+                let mut progress = |stage: &str, done: usize, total: usize| {
+                    tracing::info!("pipeline {stage}: {done}/{total}");
+                };
+                let result = runtime.block_on(whosaidwhat::pipeline::run_with_default_engines(
+                    store,
+                    router,
+                    &job.meeting_id,
+                    &job.system_wav,
+                    job.mic_wav.as_deref(),
+                    &mut progress,
+                ));
+                match result {
+                    Ok(summary_id) => {
+                        tracing::info!(
+                            "meeting {} summarized (summary {summary_id})",
+                            job.meeting_id
+                        );
+                        notify_done(&job.meeting_id);
+                    }
+                    Err(e) => {
+                        tracing::error!("pipeline failed for {}: {e}", job.meeting_id);
+                        let _ = store.set_meeting_status(&job.meeting_id, "failed:pipeline");
+                    }
+                }
+            },
+        )
+        .expect("spawn pipeline worker");
 
         let self_recording = Arc::new(AtomicBool::new(false));
         let source = MacSignalSource::new(self_recording.clone());
@@ -53,7 +100,6 @@ mod macos_main {
             config.recordings_dir().display().to_string(),
         );
 
-        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
         tracing::info!("whosaidwhat watching for meetings (policy: {:?})", config.record_policy);
 
         loop {
@@ -61,18 +107,18 @@ mod macos_main {
                 match event {
                     DetectorEvent::MeetingStarted(app) => {
                         let effects = start_for(&mut session, &app);
-                        handle_effects(&mut store, &router, &runtime, effects);
+                        handle_effects(&mut store, &worker, effects);
                     }
                     DetectorEvent::MeetingEnded(app) => {
                         let effects = session.on_meeting_ended(&app);
-                        handle_effects(&mut store, &router, &runtime, effects);
+                        handle_effects(&mut store, &worker, effects);
                         // A concurrent meeting may have been ignored while this
                         // one recorded; if the session is now free, re-offer any
                         // app still in a meeting (the detector won't re-emit).
                         if session.state() == SessionState::Idle {
                             for other in detector.active_meetings() {
                                 let effects = start_for(&mut session, &other);
-                                handle_effects(&mut store, &router, &runtime, effects);
+                                handle_effects(&mut store, &worker, effects);
                                 if session.state() != SessionState::Idle {
                                     break; // one recording at a time
                                 }
@@ -115,12 +161,7 @@ mod macos_main {
         effects
     }
 
-    fn handle_effects(
-        store: &mut Store,
-        router: &InferenceRouter,
-        runtime: &tokio::Runtime,
-        effects: Vec<SessionEffect>,
-    ) {
+    fn handle_effects(store: &mut Store, worker: &PipelineWorker, effects: Vec<SessionEffect>) {
         for effect in effects {
             match effect {
                 SessionEffect::RecordingSaved { app, saved } => {
@@ -144,8 +185,6 @@ mod macos_main {
                         tracing::error!("db: {e}");
                         continue;
                     }
-                    let system = std::path::PathBuf::from(&saved.system_path);
-                    let mic = saved.mic_path.as_ref().map(std::path::PathBuf::from);
                     let _ = store.set_meeting_audio(
                         &meeting_id,
                         Some(&saved.system_path),
@@ -153,79 +192,26 @@ mod macos_main {
                         end.as_secs() as i64,
                     );
 
-                    // ASR + diarization models load lazily per recording; on
-                    // 64 GB the ~2 GB whisper + ~50 MB diarization models could
-                    // stay resident, but cold-loading keeps the daemon's idle
-                    // footprint near zero and adds only seconds.
-                    //
-                    // Known limitation (documented in docs/00 §3): this blocks
-                    // the detection thread for the pipeline's duration, so a
-                    // meeting starting mid-processing is detected late. The
-                    // Tauri shell runs the pipeline on a background task with
-                    // its own DB connection (WAL allows the concurrent writer).
-                    let result = runtime.block_on(async {
-                        run_pipeline(store, router, &meeting_id, &system, mic.as_deref()).await
+                    // Hand off to the pipeline worker and keep polling. ASR +
+                    // diarization models load lazily per job over there; on
+                    // 64 GB the ~2 GB whisper + ~50 MB diarization models
+                    // could stay resident, but cold-loading keeps the daemon's
+                    // idle footprint near zero and adds only seconds.
+                    let queued = worker.submit(Job {
+                        meeting_id: meeting_id.clone(),
+                        system_wav: std::path::PathBuf::from(&saved.system_path),
+                        mic_wav: saved.mic_path.as_ref().map(std::path::PathBuf::from),
                     });
-                    match result {
-                        Ok(summary_id) => {
-                            tracing::info!("meeting {meeting_id} summarized (summary {summary_id})");
-                            notify_done(&meeting_id);
-                        }
-                        Err(e) => {
-                            tracing::error!("pipeline failed for {meeting_id}: {e}");
-                            let _ = store.set_meeting_status(&meeting_id, "failed:pipeline");
-                        }
+                    if !queued {
+                        // Worker thread died; the audio is safe on disk, so
+                        // record the failure honestly instead of losing it.
+                        tracing::error!("pipeline worker gone; {meeting_id} left unprocessed");
+                        let _ = store.set_meeting_status(&meeting_id, "failed:worker");
                     }
                 }
                 SessionEffect::Error { message } => tracing::error!("{message}"),
                 SessionEffect::PromptUser { .. } | SessionEffect::DismissPrompt { .. } => {}
             }
-        }
-    }
-
-    async fn run_pipeline(
-        store: &mut Store,
-        router: &InferenceRouter,
-        meeting_id: &str,
-        system_wav: &std::path::Path,
-        mic_wav: Option<&std::path::Path>,
-    ) -> anyhow::Result<i64> {
-        let config = Config::load_or_default(&Config::default().data_dir.join("config.json"));
-
-        #[cfg(feature = "asr-whisper")]
-        let mut transcriber = whosaidwhat::asr::whisper::WhisperTranscriber::new(
-            &config.whisper_model.display().to_string(),
-            &config.language,
-        )?;
-        #[cfg(not(feature = "asr-whisper"))]
-        anyhow::bail!("built without an ASR engine (enable feature asr-whisper)");
-
-        #[cfg(feature = "diarize-sherpa")]
-        let mut diarizer = whosaidwhat::diarize::sherpa::SherpaDiarizer::new(
-            &config.diarize_segmentation_model.display().to_string(),
-            &config.diarize_embedding_model.display().to_string(),
-            config.expected_speakers,
-        )?;
-        #[cfg(not(feature = "diarize-sherpa"))]
-        anyhow::bail!("built without a diarization engine (enable feature diarize-sherpa)");
-
-        #[cfg(all(feature = "asr-whisper", feature = "diarize-sherpa"))]
-        {
-            let mut progress = |stage: &str, done: usize, total: usize| {
-                tracing::info!("pipeline {stage}: {done}/{total}");
-            };
-            let summary_id = whosaidwhat::pipeline::process_recording(
-                store,
-                router,
-                &mut transcriber,
-                &mut diarizer,
-                meeting_id,
-                mic_wav.filter(|p| p.exists()),
-                system_wav,
-                &mut progress,
-            )
-            .await?;
-            Ok(summary_id)
         }
     }
 

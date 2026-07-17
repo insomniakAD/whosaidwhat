@@ -28,7 +28,9 @@ oMLX summarization endpoint**, with everything on-device.
 │  MeetingEnded ─► auto-stop: stop streams, finalize WAVs, emit           │
 │                  RecordingSaved ──────────────┐                         │
 ├───────────────────────────────────────────────▼─────────────────────────┤
-│  PIPELINE (src/pipeline.rs)                    post-meeting batch       │
+│  PIPELINE (src/pipeline/)     post-meeting batch, on a dedicated worker │
+│   thread (pipeline::worker: FIFO queue, own DB connection) so the       │
+│   detector keeps polling while a recording is processed                 │
 │   both tracks → resample 16 kHz mono                                    │
 │   system.wav ─┬─► whisper.cpp (Metal, in-process) ── AsrSegments        │
 │               └─► sherpa-onnx (ONNX, in-process) ─── SpeakerSegments    │
@@ -45,10 +47,13 @@ oMLX summarization endpoint**, with everything on-device.
 │   stage 1 extract (strict) ─ per chunk ─► oMLX POST /v1/chat/completions│
 │   stage 2 outline (strict) ──────────────► Qwen3.6-35B-A3B-oQ4e-mtp     │
 │   stage 3 rewrite (prose) ───────────────► (or router fallback model)   │
-│   → summaries (versioned, model provenance) + citations → notification  │
+│   stage 4 action items (strict, over the outline) ──► action_items      │
+│   [mm:ss] markers in notes+outline ─ llm::extract ──► summary_citations │
+│   → summaries (versioned, model provenance) → notification              │
 └─────────────────────────────────────────────────────────────────────────┘
-   UI (Tauri webview, docs/01): sidebar list · notes+transcript ·
-   who-said-what rail · recording pill — reads the same SQLite via commands
+   UI (src/shell.rs + /dist, docs/01): sidebar list · notes with citation
+   chips · transcript · who-said-what rail · consent prompt window ·
+   recording pill — same SQLite via Tauri commands, live via events
 ```
 
 The Python pipeline (`pipeline/`) is the same PIPELINE→STORE→SUMMARIZE section as
@@ -79,6 +84,11 @@ https://github.com/Zackriya-Solutions/meeting-minutes.
 - oMLX down → transcription/diarization still complete and persist
   (`status='transcribed'`); summarization retries when `healthy()` flips.
 - Preferred model missing → router fallback + `model_was_fallback=1` recorded.
+- Pipeline runs on the `pipeline::worker` thread (FIFO, own WAL connection) —
+  a meeting starting mid-processing is detected and recorded on time. Stage-4
+  action-item extraction failing never fails the meeting (summary is already
+  stored; it degrades to zero items with a log). Worker thread death is
+  recorded as `status='failed:worker'` instead of silently dropping the job.
 - App crash mid-meeting → WAVs are flushed-per-buffer and finalize on next start;
   detector state machine rebuilds from live signals (no persisted detector state).
 - Meeting app crash → process-death path emits MeetingEnded → clean auto-stop.

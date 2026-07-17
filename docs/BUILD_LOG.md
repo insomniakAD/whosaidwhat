@@ -292,3 +292,123 @@ Net: every critical and every correctness-major finding was fixed and re-tested;
 remaining open items are either genuine platform limitations with no clean fix or
 explicitly-scoped future work, and all are now stated honestly in the docs rather
 than papered over.
+
+---
+
+# Run 2 — 2026-07-14, branch `claude/build-planning-orchestration-xga7vw`
+
+Scope: exactly the four items run 1's honest-status listed as pending —
+structured citations/action-items extraction, pipeline off the detection
+thread, the Tauri v2 shell, and the `un_center` notification path. Same
+sandbox constraints (crates.io/PyPI/npm blocked; same evidence tiers).
+Research: two parallel agents (Tauri v2 shell surface; objc2
+UserNotifications), then implementation in the main loop, then an
+adversarial review workflow over the diff.
+
+### D-016 — Stage-3 prompt now preserves `[mm:ss]` markers
+**Q:** Citations need markers in the *notes*, but only the stage-2 prompt
+preserved them; stage 3 (prose rewrite) could drop every timestamp.
+**A:** Added one line to STAGE_3_PROMPT (Rust + Python, kept in lockstep):
+keep the outline's markers on the points they belong to, invent none.
+**Why:** The notes are the primary UI surface (docs/01); citations that only
+exist on the outline tab would miss the main reading path. Marker fidelity is
+enforced downstream anyway: unresolvable markers are dropped, never linked.
+
+### D-017 — Line-format stage 4, not JSON mode
+**Q:** Extract action items as JSON for easy parsing?
+**A:** No — strict `* Owner: task [mm:ss]` line format, parsed by a
+hand-rolled tolerant scanner (`llm::extract` / `wsw.extract`), mirrored in
+both languages with mirrored tests.
+**Why:** D-013 stands: the only verified oMLX contract is plain
+OpenAI-compatible chat. A malformed line degrades to a skipped item; malformed
+JSON would degrade to zero items or a retry loop.
+
+### D-018 — Citation resolution tolerance
+**Q:** A marker is truncated to whole seconds and models round; when does a
+marker stop being evidence?
+**A:** Containment first; else nearest segment start within 10 s; else drop.
+Owners resolve meeting-scoped only (`speaker_in_meeting` — a global name
+lookup would recreate the cross-meeting SPEAKER_00 collision run 1 fixed).
+**Why:** Force-linking a hallucinated `[59:59]` to the last segment would
+fabricate provenance; dropping it is the honest failure.
+
+### D-019 — Pipeline worker: one thread + FIFO channel, no async pool
+**Q:** tokio task pool for pipeline jobs?
+**A:** One dedicated worker thread draining `std::sync::mpsc`, private
+Store/router/runtime built on the thread (`pipeline::worker`), graceful
+drain-then-join on Drop. Detection thread only creates the meeting row and
+queues a Job; worker death is recorded as `failed:worker`.
+**Why:** Jobs are minutes long, arrive once per meeting, and must serialize
+anyway (whisper/Metal + one WAL writer). A pool adds failure modes, not
+throughput. `submit()` is queue-and-return — verified by a test that pushes
+100 jobs against a gated worker in <500 ms.
+
+### D-020 — Shell behind a `shell` feature; tauri-build unconditional
+**Q:** How does a Tauri app coexist with a crate whose `cargo test` must keep
+working on Linux CI without webkit2gtk?
+**A:** `tauri` is an optional dep behind `shell`; the app is a second binary
+(`whosaidwhat-app`, `required-features = ["shell"]`); build.rs gates
+`tauri_build::build()` on `CARGO_FEATURE_SHELL` (feature flags reach build
+scripts as env vars, and a build script cannot reference an uncompiled crate,
+so tauri-build itself is an unconditional build-dep — pure Rust, no system
+deps).
+**Why:** Keeps run 1's promise that the pure core tests anywhere, while the
+shell is one `--features shell` away. `mainBinaryName` in tauri.conf.json
+points the CLI at the right binary. [unverified: whether `tauri dev` passes
+`--features` through on every CLI version — plain `cargo build --features
+shell` is the documented fallback.]
+
+### D-021 — No-bundler frontend
+**Q:** Vite scaffold or static files?
+**A:** Hand-written static HTML/CSS/JS in `/dist` (`frontendDist: "../dist"`),
+`app.withGlobalTauri: true`, `window.__TAURI__.core.invoke` /
+`window.__TAURI__.event.listen`, with a bridge that tolerates late global
+injection (tauri#12990) and degrades to empty data in a plain browser. All
+dynamic markup built from escaped text; markdown rendered by a minimal
+escaping renderer, `[mm:ss]` markers become citation chips. `window.prompt`
+avoided (unreliable in wry) — speaker rename is an inline input.
+**Why:** npm is blocked here, and the UI is three pages — a bundler buys
+nothing. The webview needs no framework to render SQLite rows.
+
+### D-022 — un_center: background Start action, CustomDismissAction
+**A:** `WSW_START` is a background action (recording starts in-process;
+foregrounding the app would yank focus from the meeting); `WSW_DISMISS` is
+Destructive; the category opts into CustomDismissAction so swipe-dismiss
+reaches the delegate and clears the pending callback. Only the explicit
+Start button records — a body click is not consent. The delegate is kept
+alive by the presenter (the center holds it weakly — wezterm's lesson);
+`available()` is an NSBundle bundle-identifier check because UN APIs abort
+in unbundled binaries (Apple forums 679326/649583).
+**Evidence:** API surface verbatim from madsmtm/objc2-generated fragments
+([fetched] via code search); delegate/RcBlock patterns from wezterm
+([fetched]); bundle constraint [search-verified]. `UnCenterPrompt`'s
+`unsafe impl Send` is justified in-code by Apple's any-thread documentation
+for the center. Not compilable here — D-006 boundary, flagged in-file.
+
+### D-023 — Shell consent surface selection
+**A:** `shell.rs::PromptSurface` picks un_center when `available()` (bundled),
+else the hidden always-on-top prompt window; both deliver through the same
+ControlMsg channel as the webview buttons, and the detection loop sleeps on
+`recv_timeout(poll_interval)` so clicks are handled in milliseconds without
+busy-polling.
+
+## Run-2 verification record
+
+- Bare-rustc harness (no network): **49 tests pass** — run 1's 30 plus
+  `llm::extract` (marker parsing, resolution tolerance, action-item format,
+  quote bounds), `pipeline::worker` (FIFO, non-blocking submit,
+  drain-on-drop), and a Rust↔Python twin-parity block. The harness itself is
+  now committed (`src-tauri/harness/harness.rs`) instead of living only in
+  the run's scratch space.
+- Python: **34 tests pass** (run 1's 21 plus `test_extract.py`: parser mirrors
+  + a full `save_structured_extraction` round trip against the real schema,
+  including the hallucinated-marker drop and meeting-scoped owner rules).
+  All files `py_compile` clean.
+- `tauri.conf.json` / `capabilities/default.json`: JSON-validated here;
+  frontend JS `node --check` clean.
+- NOT verifiable here (flagged in-file, same tier as run 1's FFI):
+  `shell.rs` and `notify::un_center` against the real `tauri` /
+  `objc2-user-notifications` crates; the new `db.rs` methods run under
+  `cargo test` on a networked machine (in-memory SQLite tests included).
+- Placeholder `icons/icon.png` generated programmatically (stdlib PNG
+  encoder); real `.icns` requires `tauri icon` on a Mac.

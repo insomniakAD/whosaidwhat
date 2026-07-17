@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Meeting detected</title>
+  <link rel="stylesheet" href="css/app.css" />
+  <style> body { background: transparent; } </style>
+</head>
+<body>
+  <div class="prompt-body">
+    <div class="prompt-title" id="title">Meeting detected</div>
+    <div class="prompt-msg" id="body">Start recording? Audio stays on this Mac.</div>
+    <div class="prompt-actions">
+      <button class="btn quiet" id="ignore">Ignore</button>
+      <button class="btn primary" id="record">&#9679; Start recording</button>
+    </div>
+  </div>
+  <script src="js/bridge.js"></script>
+  <script src="js/prompt.js"></script>
+</body>
+</html>

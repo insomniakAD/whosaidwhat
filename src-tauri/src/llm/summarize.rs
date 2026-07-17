@@ -45,6 +45,7 @@ pub const STAGE_3_PROMPT: &str = r#"You are an expert writer translating an outl
 Write in a direct, calm, and human tone.
 Avoid all corporate filler and AI-speak. Do not use em dashes anywhere.
 Structure the notes using clear H2 and H3 headings, ending with an "Action Items" section listing owner and task.
+Keep the [mm:ss] timestamp markers from the outline attached to the points they belong to; do not invent new ones.
 Do not include generic opening remarks or signatures."#;
 
 #[derive(Debug, Clone)]

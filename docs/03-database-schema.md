@@ -92,12 +92,15 @@ Key decisions:
 | Audio as paths | blobs in DB | screenpipe pattern; keeps DB small and Time-Machine-friendly |
 | `action_items` table | parsing markdown at query time | cross-meeting "what do I owe people" queries |
 
-**Implementation status (honest):** `meetings`, `speakers`, `segments`,
-`segments_fts`, and `summaries` are written by both the Rust (`db.rs`) and Python
-(`store.py`) paths today. `summary_citations` and `action_items` are schema-defined
-and indexed but **not yet populated** — the summarizer currently preserves `[mm:ss]`
-markers inline in the notes rather than extracting structured citation/action rows.
-Populating them is the next pipeline step, not a schema change.
+**Implementation status (honest):** every table is now written by both the Rust
+(`db.rs`) and Python (`store.py`) paths. `summary_citations` is populated by
+resolving the summarizer's preserved `[mm:ss]` markers against real segment rows
+(`llm::extract` / `wsw.extract`; markers that resolve to no segment within a 10 s
+tolerance are dropped, never force-linked), and `action_items` by a dedicated
+stage-4 extraction call over the outline, parsed from a strict line format (no
+JSON mode — D-013) with owners resolved meeting-scoped. One caveat: transcripts
+imported from Meetily CE carry ordering-only timestamps, so their citations point
+at the correct segment but not a real audio offset (see `meetily_source.py`).
 
 **D-011 (canonical store)** — Markdown-canonical (Minutes) was considered and
 rejected for v1: whosaidwhat's segments carry ms timestamps + speaker FKs + FTS,

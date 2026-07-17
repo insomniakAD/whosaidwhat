@@ -3,5 +3,6 @@
 
 pub mod chunk;
 pub mod client;
+pub mod extract;
 pub mod router;
 pub mod summarize;

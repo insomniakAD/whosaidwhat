@@ -144,6 +144,103 @@ def save_meeting(
     return meeting_id
 
 
+def segments_for_meeting(conn: sqlite3.Connection, meeting_id: str) -> list[dict]:
+    """Transcript rows with DB identities, sorted by start (for citation
+    resolution and exports; mirror of db::segments_for_meeting in Rust)."""
+    rows = conn.execute(
+        "SELECT s.id, COALESCE(sp.display_name, 'Unknown'), s.start_ms, s.end_ms, s.text"
+        " FROM segments s LEFT JOIN speakers sp ON sp.id = s.speaker_id"
+        " WHERE s.meeting_id = ? ORDER BY s.start_ms ASC",
+        (meeting_id,),
+    ).fetchall()
+    return [
+        {"id": i, "speaker": sp, "start_ms": start, "end_ms": end, "text": text}
+        for (i, sp, start, end, text) in rows
+    ]
+
+
+def latest_summary_id(conn: sqlite3.Connection, meeting_id: str, kind: str) -> int | None:
+    row = conn.execute(
+        "SELECT id FROM summaries WHERE meeting_id = ? AND kind = ?"
+        " ORDER BY version DESC LIMIT 1",
+        (meeting_id, kind),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def speaker_in_meeting(conn: sqlite3.Connection, meeting_id: str, display_name: str) -> int | None:
+    """Speaker id by name among speakers with segments in THIS meeting only —
+    never a global lookup (meeting A's SPEAKER_00 must not resolve against
+    meeting B's row; same namespacing rule as _speaker_id_for)."""
+    row = conn.execute(
+        "SELECT sp.id FROM speakers sp WHERE sp.display_name = ? AND EXISTS"
+        " (SELECT 1 FROM segments s WHERE s.meeting_id = ? AND s.speaker_id = sp.id)"
+        " LIMIT 1",
+        (display_name, meeting_id),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def save_structured_extraction(
+    conn: sqlite3.Connection, meeting_id: str, action_response: str | None = None
+) -> dict:
+    """Populate ``summary_citations`` and ``action_items`` for a stored meeting.
+
+    Citations: every ``[mm:ss]`` marker the summarizer preserved in the latest
+    'notes' and 'outline' summaries, resolved to real segments (unresolvable
+    markers are dropped — see wsw.extract). Action items: the parsed stage-4
+    response, owners resolved meeting-scoped. Returns
+    ``{"citations": n, "action_items": n}``. One transaction: all or nothing.
+    """
+    from . import extract
+
+    segments = segments_for_meeting(conn, meeting_id)
+    counts = {"citations": 0, "action_items": 0}
+    conn.execute("BEGIN")
+    try:
+        for kind in ("notes", "outline"):
+            summary_id = latest_summary_id(conn, meeting_id, kind)
+            if summary_id is None:
+                continue
+            (content,) = conn.execute(
+                "SELECT content FROM summaries WHERE id = ?", (summary_id,)
+            ).fetchone()
+            for ms in extract.parse_timestamps(content):
+                segment_id = extract.resolve_segment(ms, segments)
+                if segment_id is None:
+                    continue
+                quote = next(
+                    (extract.quote_snippet(s["text"]) for s in segments if s["id"] == segment_id),
+                    None,
+                )
+                conn.execute(
+                    "INSERT INTO summary_citations (summary_id, segment_id, quote)"
+                    " VALUES (?, ?, ?)",
+                    (summary_id, segment_id, quote),
+                )
+                counts["citations"] += 1
+
+        if action_response:
+            notes_id = latest_summary_id(conn, meeting_id, "notes")
+            for item in extract.parse_action_items(action_response):
+                speaker_id = (
+                    speaker_in_meeting(conn, meeting_id, item["owner"])
+                    if item["owner"]
+                    else None
+                )
+                conn.execute(
+                    "INSERT INTO action_items (meeting_id, summary_id, speaker_id, text)"
+                    " VALUES (?, ?, ?, ?)",
+                    (meeting_id, notes_id, speaker_id, item["text"]),
+                )
+                counts["action_items"] += 1
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    return counts
+
+
 def fts5_sanitize(query: str) -> str:
     """Turn arbitrary user input into a safe FTS5 MATCH expression.
 

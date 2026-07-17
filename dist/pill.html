@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Recording</title>
+  <link rel="stylesheet" href="css/app.css" />
+  <style> body { background: transparent; } </style>
+</head>
+<body>
+  <!-- data-tauri-drag-region: the pill is user-movable (docs/01 — the
+       PillFloat evidence; needs core:window:allow-start-dragging). -->
+  <div class="pill-body" data-tauri-drag-region>
+    <div class="pill-dot"></div>
+    <div class="pill-time" id="time">00:00</div>
+    <div class="pill-wave" aria-hidden="true">
+      <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+    </div>
+    <button class="pill-stop" id="stop" title="Stop recording"><span></span></button>
+  </div>
+  <script src="js/bridge.js"></script>
+  <script src="js/pill.js"></script>
+</body>
+</html>
