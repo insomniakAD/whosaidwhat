@@ -35,8 +35,6 @@ jobs:
         run: cargo check --no-default-features --all-targets
       - name: cargo test
         run: cargo test --no-default-features
-      - name: bare-rustc harness (49 pure-core tests)
-        run: rustc --edition 2021 --test harness/harness.rs -o /tmp/wsw-harness && /tmp/wsw-harness
       - name: upload lockfile
         if: always()
         uses: actions/upload-artifact@v4
@@ -44,6 +42,18 @@ jobs:
           name: Cargo.lock-core
           path: src-tauri/Cargo.lock
           if-no-files-found: ignore
+
+  # The bare-rustc harness compiles src files with no crates, relying on
+  # cfg(target_os = "macos") to strip the FFI surface — so it only builds on
+  # a non-mac host. Linux is where it was authored and where it stays.
+  harness:
+    name: bare-rustc harness (pure core, linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: run harness
+        run: rustc --edition 2021 --test harness/harness.rs -o /tmp/wsw-harness && /tmp/wsw-harness
 
   shell:
     name: tauri shell check
