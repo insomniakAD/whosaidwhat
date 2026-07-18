@@ -62,7 +62,7 @@ python3 run.py meetily
 ```bash
 cd pipeline && python3 -m unittest discover tests        # 34 tests
 cd src-tauri && cargo test                               # on a normal network
-# no network at all? the bare-rustc harness runs the pure core's 49 tests:
+# no network at all? the bare-rustc harness runs the pure core's 50 tests:
 rustc --edition 2021 --test src-tauri/harness/harness.rs -o /tmp/wsw && /tmp/wsw
 ```
 
@@ -78,13 +78,17 @@ action buttons; unbundled builds use the always-on-top prompt window.
 ## Honest status
 
 Authored in a sandbox with a default-deny egress proxy (no crates.io/PyPI, most
-sites unfetchable): the pure-logic core is compiled and tested here (49 Rust
+sites unfetchable): the pure-logic core is compiled and tested here (50 Rust
 tests via the bare-rustc harness, now committed at
 `src-tauri/harness/harness.rs`, + 34 Python tests, schema exercised
 end-to-end; more rusqlite-backed Rust tests run under `cargo test`); macOS FFI,
-Tauri, and third-party-crate surfaces are written from cited evidence and
-flagged in-file where the first `cargo build` on a Mac is the type-check.
-Details: BUILD_LOG D-006/D-008 and the run-2 appendix.
+Tauri, and third-party-crate surfaces were written from cited evidence with the
+first `cargo build` on a Mac flagged as the real type-check. That build has now
+happened: the `mac-build` GitHub Actions workflow compiles and tests all of it
+on `macos-latest` — core FFI (no default features), the Tauri shell, and the
+full whisper.cpp/sherpa-onnx build (67 lib tests green on macOS). The
+CI-validated `Cargo.lock` is committed. Details: BUILD_LOG D-006/D-008, the
+run-2 appendix, and `.github/workflows/mac-build.yml`.
 
 **Built in run 2** (previously listed here as pending): structured
 `summary_citations` + `action_items` extraction in both Rust and Python; the
@@ -97,7 +101,9 @@ recording pill) making `RecordPolicy::Prompt` functional; and the
 **Still not built** (tracked honestly rather than claimed done): audio-player
 seek from citation chips (chips jump the transcript; the webview has no
 `asset:` protocol grant yet); `.icns` bundle icons (`icons/icon.png` is a
-generated placeholder — run `tauri icon` on a Mac); cross-meeting speaker
-re-identification via stored embeddings (schema-ready); and none of the Tauri
-/ objc2-user-notifications surfaces have been type-checked against their real
-crates from this sandbox.
+generated placeholder — run `tauri icon` on a Mac); and cross-meeting speaker
+re-identification via stored embeddings (schema-ready). The Tauri and
+objc2-user-notifications surfaces, previously unverified from this sandbox,
+now compile against their real crates in CI; what CI still can't prove is
+runtime behavior that needs live meetings, mic/screen-recording permissions,
+and an oMLX server — that remains a manual pass on real hardware.
