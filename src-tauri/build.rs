@@ -14,6 +14,11 @@ fn main() {
     // which then die at dyld load. Emit it ourselves.
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
+        // Bundled .app: sherpa-onnx's shared dylibs are copied into
+        // Contents/Frameworks at bundle time (see the CI bundle job); this
+        // rpath lets dyld find them there. Harmless for unbundled binaries —
+        // their build-dir rpaths still resolve first.
+        println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/../Frameworks");
     }
     if std::env::var_os("CARGO_FEATURE_SHELL").is_some() {
         tauri_build::build();

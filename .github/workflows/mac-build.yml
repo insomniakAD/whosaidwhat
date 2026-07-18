@@ -116,8 +116,26 @@ jobs:
         run: cargo clean -p sherpa-rs-sys
       - name: install tauri CLI
         run: npm install -g @tauri-apps/cli
+      - name: cargo build (release, shell)
+        # Compile before bundling so sherpa-rs-sys has downloaded its shared
+        # dylibs; tauri build below reuses this target dir and only bundles.
+        run: cargo build --release --features shell --bin whosaidwhat-app
+      - name: stage sherpa dylibs for embedding
+        # The app links onnxruntime/sherpa-onnx-c-api as @rpath dylibs that
+        # live in the sherpa-rs download cache — useless on a user's machine.
+        # Stage them and hand tauri a config overlay so they're copied into
+        # Contents/Frameworks (the binary carries the matching rpath, see
+        # build.rs).
+        run: |
+          mkdir -p frameworks
+          cp -L ~/Library/Caches/sherpa-rs/*/*/*/lib/*.dylib frameworks/ 2>/dev/null \
+            || cp -L ~/Library/Caches/sherpa-rs/*/*/lib/*.dylib frameworks/
+          ls -la frameworks/
+          printf '{"bundle":{"macOS":{"frameworks":[%s]}}}' \
+            "$(ls frameworks/*.dylib | sed 's|.*|"&"|' | paste -sd, -)" > /tmp/frameworks.json
+          cat /tmp/frameworks.json
       - name: tauri build
-        run: tauri build --features shell
+        run: tauri build --features shell --config /tmp/frameworks.json
       - name: package .app
         # tar preserves the bundle's exec bits and symlinks; upload-artifact's
         # own zip step does not.

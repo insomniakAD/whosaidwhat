@@ -25,3 +25,6 @@ recordings/
 last_processed.txt
 meeting_blog_post.md
 logs/*.log
+
+# CI-staged dylibs for bundling (mac-build bundle job)
+src-tauri/frameworks/
