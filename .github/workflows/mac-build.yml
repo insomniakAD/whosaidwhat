@@ -1,10 +1,14 @@
-# The first real Mac toolchain pass over code authored in a no-crates.io
-# sandbox. Three independent jobs, cheapest signal first:
-#   core   — type-check + test the macOS FFI surface (objc2*, cpal,
-#            screencapturekit, coreaudio-sys) without the heavy native deps
-#   shell  — Tauri v2 codegen + shell binary type-check
-#   full   — default features: whisper.cpp (Metal) + sherpa-onnx native builds,
-#            then the whole test suite
+# The Mac toolchain pipeline for code authored in a no-crates.io sandbox.
+# Independent jobs, cheapest signal first:
+#   core    — type-check + test the macOS FFI surface (objc2*, cpal,
+#             screencapturekit, coreaudio-sys) without the heavy native deps
+#   shell   — Tauri v2 codegen + shell binary type-check
+#   full    — default features: whisper.cpp (Metal) + sherpa-onnx native
+#             builds, then the whole test suite
+#   bundle  — tauri build (default features + shell): the .app and .dmg,
+#             uploaded as artifacts (ad-hoc signed; no signing identity)
+#   harness — the bare-rustc pure-core tests, on Linux where crate-free
+#             compilation is possible
 name: mac-build
 
 on:
@@ -95,3 +99,36 @@ jobs:
         run: cargo build
       - name: cargo test (default features)
         run: cargo test
+
+  bundle:
+    name: tauri bundle (.app + .dmg)
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: bundle
+          # Same cache hazard as the full job (see above).
+          cache-directories: ~/Library/Caches/sherpa-rs
+      - name: re-run sherpa-rs-sys build script
+        run: cargo clean -p sherpa-rs-sys
+      - name: install tauri CLI
+        run: npm install -g @tauri-apps/cli
+      - name: tauri build
+        run: tauri build --features shell
+      - name: package .app
+        # tar preserves the bundle's exec bits and symlinks; upload-artifact's
+        # own zip step does not.
+        run: tar -czf whosaidwhat-app.tar.gz -C target/release/bundle/macos whosaidwhat.app
+      - name: upload .app
+        uses: actions/upload-artifact@v4
+        with:
+          name: whosaidwhat-app
+          path: src-tauri/whosaidwhat-app.tar.gz
+      - name: upload .dmg
+        uses: actions/upload-artifact@v4
+        with:
+          name: whosaidwhat-dmg
+          path: src-tauri/target/release/bundle/dmg/*.dmg
