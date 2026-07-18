@@ -100,9 +100,11 @@ recording pill) making `RecordPolicy::Prompt` functional; and the
 
 **Still not built** (tracked honestly rather than claimed done): audio-player
 seek from citation chips (chips jump the transcript; the webview has no
-`asset:` protocol grant yet); `.icns` bundle icons (`icons/icon.png` is a
-generated placeholder — run `tauri icon` on a Mac); and cross-meeting speaker
-re-identification via stored embeddings (schema-ready). The Tauri and
+`asset:` protocol grant yet); and cross-meeting speaker re-identification via
+stored embeddings (schema-ready). Bundle icons are real now (`tauri icon`
+output from a 1024px redraw of the placeholder mark, `.icns` included), and
+the `bundle` CI job runs `tauri build` and uploads the `.app` and `.dmg` as
+artifacts — ad-hoc signed, since no signing identity is configured. The Tauri and
 objc2-user-notifications surfaces, previously unverified from this sandbox,
 now compile against their real crates in CI; what CI still can't prove is
 runtime behavior that needs live meetings, mic/screen-recording permissions,
