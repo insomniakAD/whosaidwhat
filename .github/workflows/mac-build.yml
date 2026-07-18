@@ -78,6 +78,15 @@ jobs:
         with:
           workspaces: src-tauri
           key: full
+          # sherpa-rs-sys downloads its prebuilt sherpa-onnx libs here; a
+          # restored target/ marks the build script fresh while this dir is
+          # gone on a new runner, so the linker finds no onnxruntime.
+          cache-directories: ~/Library/Caches/sherpa-rs
+      - name: re-run sherpa-rs-sys build script
+        # Its OUT_DIR libs don't survive the cache round-trip; cleaning just
+        # this package forces the (cheap, cached-download) script to restage
+        # them without invalidating the rest of the target dir.
+        run: cargo clean -p sherpa-rs-sys
       - name: tool versions
         run: |
           rustc -V && cargo -V && cmake --version | head -1
