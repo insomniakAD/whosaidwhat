@@ -249,14 +249,15 @@ impl SystemAudioSource for SckSystemAudio {
         impl SCStreamOutputTrait for AudioOut {
             fn did_output_sample_buffer(
                 &self,
-                sample: screencapturekit::output::CMSampleBuffer,
+                sample: screencapturekit::cm::CMSampleBuffer,
                 of_type: SCStreamOutputType,
             ) {
                 if !matches!(of_type, SCStreamOutputType::Audio) {
                     return;
                 }
-                let Ok(buffers) = sample.get_audio_buffer_list() else { return };
-                let channels: Vec<&[f32]> = buffers.iter().map(|b| b.as_f32_slice()).collect();
+                let Some(buffers) = sample.audio_buffer_list() else { return };
+                // AudioBuffer exposes raw bytes; SCK audio is native-endian f32.
+                let channels: Vec<&[u8]> = buffers.iter().map(|b| b.data()).collect();
                 if channels.is_empty() {
                     return;
                 }
@@ -264,13 +265,16 @@ impl SystemAudioSource for SckSystemAudio {
                 // WAV writer expects interleaved frames, so zip the channels
                 // (L,R,L,R,...). Writing each planar buffer straight through
                 // would scramble the file into [all-L][all-R].
-                let frames = channels.iter().map(|c| c.len()).min().unwrap_or(0);
+                let frames = channels.iter().map(|c| c.len() / 4).min().unwrap_or(0);
                 let mut interleaved = self.scratch.lock().unwrap();
                 interleaved.clear();
                 interleaved.reserve(frames * channels.len());
                 for f in 0..frames {
                     for ch in &channels {
-                        interleaved.push(ch[f]);
+                        let i = f * 4;
+                        interleaved.push(f32::from_ne_bytes([
+                            ch[i], ch[i + 1], ch[i + 2], ch[i + 3],
+                        ]));
                     }
                 }
                 if let Ok(mut sink) = self.sink.lock() {
@@ -286,14 +290,14 @@ impl SystemAudioSource for SckSystemAudio {
             .into_iter()
             .next()
             .ok_or_else(|| CaptureError::SystemAudio("no display".into()))?;
-        let filter = SCContentFilter::new().with_display_excluding_windows(&display, &[]);
+        let filter = SCContentFilter::create()
+            .with_display(&display)
+            .with_excluding_windows(&[])
+            .build();
         let config = SCStreamConfiguration::new()
-            .set_captures_audio(true)
-            .map_err(|e| CaptureError::SystemAudio(format!("{e:?}")))?
-            .set_sample_rate(48_000)
-            .map_err(|e| CaptureError::SystemAudio(format!("{e:?}")))?
-            .set_channel_count(2)
-            .map_err(|e| CaptureError::SystemAudio(format!("{e:?}")))?;
+            .with_captures_audio(true)
+            .with_sample_rate(48_000)
+            .with_channel_count(2);
 
         let mut stream = SCStream::new(&filter, &config);
         stream.add_output_handler(

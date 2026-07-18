@@ -1,0 +1,97 @@
+# The first real Mac toolchain pass over code authored in a no-crates.io
+# sandbox. Three independent jobs, cheapest signal first:
+#   core   — type-check + test the macOS FFI surface (objc2*, cpal,
+#            screencapturekit, coreaudio-sys) without the heavy native deps
+#   shell  — Tauri v2 codegen + shell binary type-check
+#   full   — default features: whisper.cpp (Metal) + sherpa-onnx native builds,
+#            then the whole test suite
+name: mac-build
+
+on:
+  push:
+    branches: [claude/mac-toolchain-build-xjyk72, main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+defaults:
+  run:
+    working-directory: src-tauri
+
+jobs:
+  core:
+    name: core check + test (no default features)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: core
+      - name: cargo check (all targets)
+        run: cargo check --no-default-features --all-targets
+      - name: cargo test
+        run: cargo test --no-default-features
+      - name: upload lockfile
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Cargo.lock-core
+          path: src-tauri/Cargo.lock
+          if-no-files-found: ignore
+
+  # The bare-rustc harness compiles src files with no crates, relying on
+  # cfg(target_os = "macos") to strip the FFI surface — so it only builds on
+  # a non-mac host. Linux is where it was authored and where it stays.
+  harness:
+    name: bare-rustc harness (pure core, linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: run harness
+        run: rustc --edition 2021 --test harness/harness.rs -o /tmp/wsw-harness && /tmp/wsw-harness
+
+  shell:
+    name: tauri shell check
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: shell
+      - name: cargo check --features shell
+        run: cargo check --no-default-features --features shell --bin whosaidwhat-app
+
+  full:
+    name: full build + test (whisper + sherpa)
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: full
+          # sherpa-rs-sys downloads its prebuilt sherpa-onnx libs here; a
+          # restored target/ marks the build script fresh while this dir is
+          # gone on a new runner, so the linker finds no onnxruntime.
+          cache-directories: ~/Library/Caches/sherpa-rs
+      - name: re-run sherpa-rs-sys build script
+        # Its OUT_DIR libs don't survive the cache round-trip; cleaning just
+        # this package forces the (cheap, cached-download) script to restage
+        # them without invalidating the rest of the target dir.
+        run: cargo clean -p sherpa-rs-sys
+      - name: tool versions
+        run: |
+          rustc -V && cargo -V && cmake --version | head -1
+          xcodebuild -version || true
+      - name: cargo build (default features)
+        run: cargo build
+      - name: cargo test (default features)
+        run: cargo test

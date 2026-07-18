@@ -54,7 +54,8 @@ impl SamplingProfile {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct RouterConfig {
     /// e.g. "http://localhost:8000/v1"
     pub omlx_base_url: String,

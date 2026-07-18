@@ -440,7 +440,7 @@ pub mod workspace {
                         &block,
                     )
                 };
-                tokens.push(token);
+                tokens.push(token.into());
             }
             WorkspaceWatcher { tokens }
         }
