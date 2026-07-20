@@ -28,3 +28,7 @@ logs/*.log
 
 # CI-staged dylibs for bundling (mac-build bundle job)
 src-tauri/frameworks/
+
+# graphify local machine state
+graphify-out/.graphify_python
+graphify-out/.graphify_root
